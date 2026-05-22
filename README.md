@@ -29,10 +29,10 @@ Logictics-real-time/
 
 ```bash
 docker build -t logictics-bot:latest -f Dockerfile.data_ingestion .
-docker build --no-cache -t logictics-backend:v5 -f Dockerfile.backend .
-docker build -t logictics-frontend:v2 -f Dockerfile.frontend .
+docker build --no-cache -t logictics-backend:v7 -f Dockerfile.backend .
+docker build -t logictics-frontend:v4 -f Dockerfile.frontend .
 docker build -t logictics-opt:v4 -f Dockerfile.route_optimization .
-docker build -t logictics-stream:v4 -f Dockerfile.stream_processing .
+docker build -t logictics-stream:v5 -f Dockerfile.stream_processing .
 ```
 
 ### 2. Deploy infrastructure
@@ -98,10 +98,10 @@ kubectl delete -f k8s/01-infrastructure.yaml  # Xoá infra
 
 ## 📌 Ports
 
-| Service | Port |
-|---------|------|
-| Frontend | 3000 (K8s) / 5173 (Compose) |
-| Backend API | 4000 |
-| Kafka | 9092 |
-| MongoDB | 27017 |
-| Redis | 6379 |
+| Service     | Port                        |
+| ----------- | --------------------------- |
+| Frontend    | 3000 (K8s) / 5173 (Compose) |
+| Backend API | 4000                        |
+| Kafka       | 9092                        |
+| MongoDB     | 27017                       |
+| Redis       | 6379                        |

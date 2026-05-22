@@ -5,6 +5,7 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const redis = require("redis");
 const { Kafka } = require("kafkajs");
+const PathFinder = require("./pathfinder");
 
 const app = express();
 app.use(cors());
@@ -15,6 +16,15 @@ const io = new Server(server, {
 });
 
 // --- CẤU HÌNH KẾT NỐI (K8s Service names) ---
+// --- PATHFINDER (tính route shortest-path on-demand) ---
+const pathfinder = new PathFinder();
+const EDGES_PATH = process.env.EDGES_JSON || "/app/data/edges_schema.json";
+try {
+  pathfinder.load(EDGES_PATH);
+} catch (err) {
+  console.warn("⚠️ PathFinder: Không load được edges:", err.message);
+}
+
 const MONGO_URI = process.env.MONGO_URI || "mongodb://mongodb:27017/traffic_system?replicaSet=rs0";
 const REDIS_URL = process.env.REDIS_HOST ? `redis://${process.env.REDIS_HOST}:6379` : "redis://redis.default.svc.cluster.local:6379";
 const KAFKA_BROKER = process.env.KAFKA_BROKER || "kafka:9092";
@@ -119,6 +129,10 @@ runKafkaForever();
 const RouteModel = mongoose.model("Route", new mongoose.Schema({
   vehicle_id: String,
   new_assigned_route: [String],
+  assigned_route: [String],
+  remaining_customers: [{
+    cust_id: String, latitude: Number, longitude: Number
+  }],
   estimated_total_travel_time: Number,
 }), "assigned_routes");
 
@@ -168,22 +182,80 @@ io.on("connection", (socket) => {
 
   emitRoutesSnapshot(socket);
 
+  // --- REQUEST ROUTE ON-DEMAND ---
+  // Frontend gửi event khi user chọn xe → tính shortest path realtime
+  socket.on("request_route", async (data) => {
+    try {
+      const { vehicle_id, lat, lon } = data || {};
+      if (!vehicle_id || lat == null || lon == null) {
+        socket.emit("route_result", { vehicle_id, error: "Missing lat/lon" });
+        return;
+      }
+
+      if (!pathfinder.loaded) {
+        socket.emit("route_result", { vehicle_id, path: [], time: 0, error: "PathFinder not loaded" });
+        return;
+      }
+
+      // Lấy customers từ MongoDB (remaining_customers trong assigned_routes)
+      let customers = [];
+      if (mongoReady) {
+        const doc = await RouteModel.findOne({ vehicle_id }).lean();
+        if (doc && doc.remaining_customers && doc.remaining_customers.length > 0) {
+          customers = doc.remaining_customers;
+        }
+      }
+
+      if (customers.length === 0) {
+        // Nếu MongoDB chưa có customers → tạo random 5 điểm giao hàng gần xe
+        // (demo mode - khi chưa seed MongoDB)
+        const nearNode = pathfinder.nearestNode(lat, lon);
+        if (nearNode) {
+          // Lấy 5 node ngẫu nhiên trong graph làm điểm giao hàng demo
+          const allNodes = Object.entries(pathfinder._nodeCoords);
+          for (let i = 0; i < Math.min(5, allNodes.length); i++) {
+            const randIdx = Math.floor(Math.random() * allNodes.length);
+            const [, coords] = allNodes[randIdx];
+            customers.push({ cust_id: `Demo_${i+1}`, latitude: coords.lat, longitude: coords.lon });
+          }
+        }
+      }
+
+      if (customers.length === 0) {
+        socket.emit("route_result", { vehicle_id, path: [], time: 0, error: "No customers" });
+        return;
+      }
+
+      // Tính shortest path liên tục từ vị trí xe → qua tất cả customer
+      const result = pathfinder.buildRoute(lat, lon, customers);
+
+      socket.emit("route_result", {
+        vehicle_id,
+        path: result.path,
+        time: Math.round(result.totalCost),
+      });
+      console.log(`🗺️ Route calculated for ${vehicle_id}: ${result.path.length} edges, ${Math.round(result.totalCost)}s`);
+    } catch (err) {
+      console.error("request_route error:", err.message);
+      socket.emit("route_result", { vehicle_id: data?.vehicle_id, path: [], error: err.message });
+    }
+  });
+
   const trafficInterval = setInterval(async () => {
     if (!redisReady) return; // Bỏ qua nếu Redis chưa sẵn sàng
     try {
-      // Dùng SCAN thay vì KEYS (non-blocking) + MGET batch
-      const keys = [];
-      for await (const key of redisClient.scanIterator({ MATCH: "edge:*", COUNT: 200 })) {
-        keys.push(key);
-      }
+      // Dùng KEYS + GET từng key (ổn định, tránh lỗi Buffer với scanIterator/mGet)
+      const keys = await redisClient.keys("edge:*");
       if (keys.length > 0) {
-        const values = await redisClient.mGet(keys);
         const trafficBatch = [];
-        for (let i = 0; i < keys.length; i++) {
-          if (values[i]) {
-            const payload = JSON.parse(values[i]);
-            trafficBatch.push({ edge_id: keys[i].replace("edge:", ""), avg_speed: payload.avg_speed || 0 });
-          }
+        for (const key of keys) {
+          try {
+            const rawData = await redisClient.get(String(key));
+            if (rawData) {
+              const payload = JSON.parse(rawData);
+              trafficBatch.push({ edge_id: String(key).replace("edge:", ""), avg_speed: payload.avg_speed || 0 });
+            }
+          } catch (_) { /* skip */ }
         }
         if (trafficBatch.length > 0) {
           socket.emit("traffic_batch", trafficBatch);

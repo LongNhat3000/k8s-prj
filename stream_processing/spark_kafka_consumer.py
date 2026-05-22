@@ -1,5 +1,6 @@
 """
 Stream Processing Module - Logistics Real-Time
+PySpark Structured Streaming: Kafka → Aggregate → Redis
 
 
 """
@@ -7,6 +8,7 @@ Stream Processing Module - Logistics Real-Time
 import os
 import json
 import math
+import glob
 import logging
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
@@ -154,7 +156,7 @@ def main():
 
     spark = (SparkSession.builder
     .appName("LogisticsProcessing")
-    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.13:3.5.0")
+    .config("spark.jars", ",".join(glob.glob("/opt/spark-jars/*.jar")))
     .config("spark.executor.memory", "1g") # Giới hạn để không bị tràn RAM
     .config("spark.driver.memory", "1g")
     .getOrCreate())

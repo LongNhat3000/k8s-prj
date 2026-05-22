@@ -40,7 +40,7 @@ spec:
     spec:
       containers:
         - name: stream-processing
-          image: logictics-stream:v4
+          image: logictics-stream:v5
           imagePullPolicy: IfNotPresent
           env:
             - name: KAFKA_BROKER
@@ -115,7 +115,7 @@ spec:
     spec:
       containers:
         - name: dashboard-backend
-          image: logictics-backend:v5
+          image: logictics-backend:v7
           imagePullPolicy: IfNotPresent
           env:
             - name: REDIS_HOST
@@ -159,7 +159,7 @@ spec:
     spec:
       containers:
         - name: dashboard-frontend
-          image: logictics-frontend:v2
+          image: logictics-frontend:v4
           imagePullPolicy: IfNotPresent
           env:
             - name: BACKEND_INTERNAL_URL

@@ -93,22 +93,38 @@ def build_new_assigned_route(
     old_assigned_route: list,
     ga_result: Dict[str, Any],
     opt_input: Dict[str, Any],
+    graph=None,
 ) -> list:
     """
-    Tao route edge_id moi cho dashboard.
+    Tạo route edge_id mới LIỀN MẠCH cho dashboard.
 
-    Hien tai:
-    - GA chi tra ve optimized_customer_order.
-    - Chua co module convert customer order -> shortest path edge list.
-    - Do do tam thoi tra ve old_assigned_route de dashboard nhan duoc
-      new_assigned_route hop le va ve duoc Polyline.
-
-    Sau nay nang cap:
-    - Load graph edges_schema.json.
-    - Map customer toa do -> nearest edge/node.
-    - Dung NetworkX shortest_path voi cost tu Redis.
-    - Tra ve list edge_id moi.
+    Sử dụng GraphNetwork.shortest_path() để nối liên tục
+    từ edge hiện tại qua tất cả customers theo thứ tự GA tối ưu.
     """
+    # Nếu có graph → tính route liền mạch thực sự
+    if graph is not None:
+        from route_builder import build_route
+
+        start_edge = opt_input.get("current_edge_id", "")
+        optimized_customers = ga_result.get("optimized_customers", [])
+
+        # Nếu GA không trả customers dạng dict, dùng remaining_customers gốc
+        if not optimized_customers:
+            optimized_customers = opt_input.get("remaining_customers", [])
+
+        blocked_edges = opt_input.get("blocked_edges", [])
+
+        new_route = build_route(
+            graph=graph,
+            start_edge=start_edge,
+            customer_order=optimized_customers,
+            blocked_edges=blocked_edges,
+        )
+
+        if new_route:
+            return new_route
+
+    # Fallback: trả về old_assigned_route nếu graph không có hoặc route rỗng
     if old_assigned_route:
         return old_assigned_route
 
@@ -172,6 +188,7 @@ def save_optimization_result_to_mongo(
 def optimize_vehicle(
     vehicle_doc: Dict[str, Any],
     redis_client: Any,
+    graph=None,
     mongo_collection: Optional[Any] = None,
     min_avg_speed: float = DEFAULT_MIN_AVG_SPEED,
     population_size: int = DEFAULT_POPULATION_SIZE,
@@ -215,6 +232,7 @@ def optimize_vehicle(
             old_assigned_route=old_assigned_route,
             ga_result=ga_result,
             opt_input=opt_input,
+            graph=graph,
         )
 
         mongo_updated = False
@@ -242,6 +260,7 @@ def optimize_vehicle(
 def optimize_many_vehicles(
     vehicle_docs: list,
     redis_client: Any,
+    graph=None,
     mongo_collection: Optional[Any] = None,
     min_avg_speed: float = DEFAULT_MIN_AVG_SPEED,
     population_size: int = DEFAULT_POPULATION_SIZE,
@@ -259,6 +278,7 @@ def optimize_many_vehicles(
         result = optimize_vehicle(
             vehicle_doc=vehicle_doc,
             redis_client=redis_client,
+            graph=graph,
             mongo_collection=mongo_collection,
             min_avg_speed=min_avg_speed,
             population_size=population_size,
@@ -367,11 +387,13 @@ if __name__ == "__main__":
     import time
     from pymongo import MongoClient
     import redis
+    from graph_network import GraphNetwork
+    from traffic_adapter import TrafficAdapter
 
     print("🚀 Khởi động Route Optimization Worker...")
 
     # 1. Kết nối thật vào các hệ thống
-    mongo_uri = os.getenv("MONGO_URI", "mongodb://mongodb.default.svc.cluster.local:27017/")
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://mongodb.default.svc.cluster.local:27017/?directConnection=true")
     redis_host = os.getenv("REDIS_HOST", "redis.default.svc.cluster.local")
     redis_port = int(os.getenv("REDIS_PORT_NUM", 6379))
 
@@ -384,7 +406,18 @@ if __name__ == "__main__":
     print(f"🔗 Đang kết nối Redis: {redis_host}:{redis_port}")
     real_redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
 
-    print("✅ Đã kết nối thành công! Bắt đầu giám sát giao thông 24/7...")
+    # 3. Load graph network (edges_schema.json) cho pathfinding
+    edges_json = os.getenv("EDGES_JSON", "/app/data/edges_schema.json")
+    print(f"🗺️  Đang load bản đồ: {edges_json}")
+    graph = GraphNetwork()
+    graph.load_from_schema(edges_json)
+    print(f"✅ Graph loaded: {len(graph.nodes)} nodes, {len(graph.edges)} edges")
+
+    # 4. Gắn traffic adapter (đọc real-time traffic từ Redis) vào graph
+    traffic_adapter = TrafficAdapter(host=redis_host, port=redis_port)
+    graph.set_traffic_adapter(traffic_adapter)
+
+    print("✅ Đã kết nối thành công! Bắt đầu giám sát giao thông & tối ưu lộ trình 24/7...")
 
     # 2. Vòng lặp vĩnh cửu của Kubernetes
     while True:
@@ -399,6 +432,7 @@ if __name__ == "__main__":
                 result = optimize_many_vehicles(
                     vehicle_docs=vehicle_docs,
                     redis_client=real_redis_client,
+                    graph=graph,
                     mongo_collection=real_mongo_collection,
                     force=False # Chỉ chạy lại thuật toán GA khi đường bị kẹt (theo logic của bạn)
                 )

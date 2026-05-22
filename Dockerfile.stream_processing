@@ -2,22 +2,33 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Cài đặt Java (Bắt buộc để chạy được PySpark)
+# Cài Java (bắt buộc cho PySpark)
 RUN apt-get update && \
-    apt-get install -yq --no-install-recommends default-jre && \
+    apt-get install -yq --no-install-recommends default-jre curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Cài đặt các thư viện cần thiết
-RUN pip install --default-timeout=1000 --no-cache-dir pyspark redis confluent-kafka shapely
+# Cài thư viện Python
+RUN pip install --default-timeout=1000 --no-cache-dir pyspark==3.5.0 redis confluent-kafka shapely
 
-# Tạo thư mục checkpoint cho Spark khỏi báo lỗi quyền truy cập
+# Tải trước Kafka connector JARs (KHÔNG phụ thuộc internet lúc runtime)
+RUN mkdir -p /opt/spark-jars && \
+    curl -sL -o /opt/spark-jars/spark-sql-kafka-0-10_2.12-3.5.0.jar \
+        https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.0/spark-sql-kafka-0-10_2.12-3.5.0.jar && \
+    curl -sL -o /opt/spark-jars/kafka-clients-3.4.1.jar \
+        https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar && \
+    curl -sL -o /opt/spark-jars/spark-token-provider-kafka-0-10_2.12-3.5.0.jar \
+        https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.0/spark-token-provider-kafka-0-10_2.12-3.5.0.jar && \
+    curl -sL -o /opt/spark-jars/commons-pool2-2.11.1.jar \
+        https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar
+
+# Tạo thư mục checkpoint
 RUN mkdir -p /tmp/spark_checkpoint && chmod 777 /tmp/spark_checkpoint
 
-# Copy thư mục data từ máy tính vào trong container
-COPY data/ /app/data/
-
-# Copy thư mục chung và thư mục code
+# Copy code + data
 COPY data/ ./data/
 COPY stream_processing/ ./stream_processing/
 
-CMD ["python", "stream_processing/spark_kafka_consumer.py"]
+# Đặt WORKDIR trong stream_processing để import local modules đúng
+WORKDIR /app/stream_processing
+
+CMD ["python", "-u", "spark_kafka_consumer.py"]

@@ -2,11 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+RUN pip install --no-cache-dir networkx pymongo redis confluent-kafka
+
+# Copy code + data
 COPY stream_processing/ ./stream_processing/
-
-RUN pip install networkx pymongo redis confluent-kafka
-
 COPY data/ ./data/
 COPY route_optimization/ ./route_optimization/
 
-CMD ["python", "route_optimization/route_optimizer.py"]
+# WORKDIR vào route_optimization để import local modules đúng
+# (graph_network, route_builder, genetic_algorithm, etc.)
+# traffic_adapter.py đã tự thêm PROJECT_ROOT vào sys.path
+WORKDIR /app/route_optimization
+
+CMD ["python", "-u", "route_optimizer.py"]
