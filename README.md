@@ -1,21 +1,12 @@
-# 🚚 Logistics Real-Time: Tối ưu tuyến đường giao hàng thời gian thực
+# 🚚 Logistics Real-Time — Tối ưu tuyến đường giao hàng thời gian thực
 
-## 1. Mô tả bài toán
+## Mô tả
 
-Một công ty vận chuyển quản lý **100 xe tải** hoạt động trên bản đồ Hà Nội. Mỗi xe phục vụ **10 khách hàng** tại các vị trí khác nhau. Hệ thống cần:
-
-1. **Mô phỏng giao thông** — 10.000 phương tiện (100 xe tải + 9.900 xe máy/ô tô) di chuyển trên 9.026 cạnh đường, tạo dữ liệu GPS real-time.
-2. **Xử lý luồng dữ liệu lớn** — Nhận ~10.000 GPS messages/giây từ Kafka, map-matching vào đoạn đường, tính tốc độ trung bình mỗi cạnh.
-3. **Phát hiện tắc nghẽn** — Cạnh có avg_speed ≤ 5 km/h → đánh dấu tắc đường.
-4. **Tối ưu tuyến đường** — Dùng thuật toán di truyền (GA) tìm thứ tự giao hàng tối ưu cho mỗi xe, tránh đoạn tắc, và tính shortest-path (Dijkstra) qua 10 điểm giao hàng.
-5. **Dashboard trực quan** — Bản đồ realtime hiển thị xe, traffic heatmap, và lộ trình tối ưu khi chọn xe.
-
-**Input**: Bản đồ Hà Nội (OSM), 100 xe × 10 khách hàng = 1.000 điểm giao hàng.  
-**Output**: Tuyến đường tối ưu liên tục (danh sách edge_id) cho từng xe, cập nhật realtime khi giao thông thay đổi.
+Hệ thống mô phỏng và tối ưu tuyến đường giao hàng real-time cho **100 xe tải × 10 khách hàng** trên bản đồ Hà Nội. Xử lý ~10.000 GPS messages/giây, phát hiện tắc nghẽn, và tự động tái tối ưu tuyến đường bằng Genetic Algorithm + Dijkstra.
 
 ---
 
-## 2. Kiến trúc hệ thống
+## Kiến trúc hệ thống
 
 ```
 ┌────────────────┐         ┌─────────┐         ┌──────────────────┐         ┌───────┐
@@ -50,36 +41,68 @@ Một công ty vận chuyển quản lý **100 xe tải** hoạt động trên b
 | Route Optimization | Python, GA + Dijkstra            | Tối ưu thứ tự 10 khách/xe, tính shortest-path   |
 | Backend            | Node.js, Socket.IO, KafkaJS      | Trung gian: Kafka + Redis + MongoDB → Frontend  |
 | Frontend           | React, Leaflet Canvas            | Dashboard realtime                              |
-| Infrastructure     | Kafka, Redis, MongoDB, Zookeeper | Trên Kubernetes                                 |
+| Infrastructure     | Kafka, Redis, MongoDB, Zookeeper | Message broker, cache, storage                  |
 
 ---
 
-## 3. Thuật toán tối ưu tuyến đường
+## Tech Stack
+
+- **Message Broker**: Apache Kafka + Zookeeper
+- **Stream Processing**: PySpark Structured Streaming
+- **Cache**: Redis 7
+- **Database**: MongoDB 6 (ReplicaSet cho Change Stream)
+- **Backend**: Node.js + Socket.IO + KafkaJS
+- **Frontend**: React + Leaflet Canvas
+- **Optimization**: Genetic Algorithm + Dijkstra (Python)
+- **Orchestration**: Kubernetes (Docker Desktop) / Docker Compose
+
+---
+
+## Cấu trúc thư mục
+
+```
+Logictics-real-time/
+├── data_ingestion/          # Bot simulation — GPS producer
+├── stream_processing/       # PySpark consumer — map-matching + Redis
+├── route_optimization/      # GA + Dijkstra optimizer
+├── dashboard/
+│   ├── bridge-server/       # Node.js backend (Socket.IO + REST)
+│   └── frontend/            # React + Leaflet
+├── data/                    # edges_schema.json, nodes, ...
+├── k8s/
+│   ├── 01-infrastructure.yaml
+│   └── 02-microservices.yaml
+├── infrastructure/          # Docker Compose config
+├── Dockerfile.data_ingestion
+├── Dockerfile.stream_processing
+├── Dockerfile.route_optimization
+├── Dockerfile.backend
+└── Dockerfile.frontend
+```
+
+---
+
+## Thuật toán tối ưu tuyến đường
 
 **Bài toán**: Cho xe tải tại vị trí hiện tại, cần giao hàng cho 10 khách → tìm thứ tự đi + đường đi ngắn nhất.
 
-### Bước 1: Genetic Algorithm (GA) — tối ưu thứ tự khách hàng
+### Bước 1: Genetic Algorithm — tối ưu thứ tự khách hàng
 
-- **Cá thể**: Hoán vị [K1, K2, ..., K10] (thứ tự giao hàng)
+- **Cá thể**: Hoán vị [K1, K2, ..., K10]
 - **Fitness**: Tổng thời gian di chuyển (dựa trên avg_speed realtime từ Redis)
 - **Operators**: Crossover (OX), Mutation (swap), Selection (tournament)
 - **Population**: 30 cá thể × 60 thế hệ
-- **Kết quả**: Thứ tự giao hàng tối ưu tránh đoạn tắc
 
-### Bước 2: Dijkstra — tìm đường ngắn nhất giữa mỗi cặp
-
-Sau khi GA cho thứ tự [K3, K7, K1, ...], tính shortest-path liên tục:
+### Bước 2: Dijkstra — shortest-path giữa mỗi cặp
 
 ```
 Vị trí xe → K3 → K7 → K1 → ... → K10
      Dijkstra  Dijkstra  Dijkstra
 ```
 
-**Kết quả cuối**: Mảng edge_id liên tục — xe đi chính xác trên đường, không "chim bay".
+**Kết quả**: Mảng edge_id liên tục — xe đi chính xác trên đường, không "chim bay".
 
-### Bước 3: Re-optimize khi giao thông thay đổi
-
-Service route-optimization chạy vòng lặp mỗi 30s:
+### Bước 3: Re-optimize mỗi 30s
 
 - Đọc traffic mới từ Redis (blocked_edges)
 - Nếu route hiện tại đi qua đoạn tắc → chạy lại GA + Dijkstra
@@ -87,92 +110,105 @@ Service route-optimization chạy vòng lặp mỗi 30s:
 
 ---
 
-## 4. Chạy với Kubernetes
+## Triển khai
 
-```bash
-# 1. Build images
-docker build -t logictics-bot:latest       -f Dockerfile.data_ingestion .
-docker build -t logictics-stream:v4        -f Dockerfile.stream_processing .
-docker build -t logictics-opt:v5           -f Dockerfile.route_optimization .
-docker build -t logictics-backend:v7       -f Dockerfile.backend .
-docker build -t logictics-frontend:v4      -f Dockerfile.frontend .
+### Yêu cầu
 
-# 2. Deploy
+- Docker Desktop (bật Kubernetes trong Settings → Kubernetes → Enable)
+- kubectl (đi kèm Docker Desktop)
+
+---
+
+### Option 1: Kubernetes (Docker Desktop)
+
+#### 1. Build images
+
+```powershell
+docker build -t logictics-bot:latest -f Dockerfile.data_ingestion .
+docker build -t logictics-stream:v5 -f Dockerfile.stream_processing .
+docker build -t logictics-opt:v6 -f Dockerfile.route_optimization .
+docker build -t logictics-backend:v7 -f Dockerfile.backend .
+docker build -t logictics-frontend:v4 -f Dockerfile.frontend .
+```
+
+#### 2. Deploy infrastructure
+
+```powershell
 kubectl apply -f k8s/01-infrastructure.yaml
-kubectl get pods -w                          # Đợi Running
+kubectl get pods -w                          # Đợi tất cả Running
+```
 
-# 3. Init MongoDB ReplicaSet
-kubectl exec -it $(kubectl get pod -l app=mongodb -o name) -- mongosh --eval \
-  "rs.initiate({_id:'rs0', members:[{_id:0, host:'mongodb.default.svc.cluster.local:27017'}]})"
+#### 3. Init MongoDB ReplicaSet
 
-# 4. Deploy microservices
+```powershell
+kubectl exec -it deployment/mongodb -- mongosh --eval "rs.initiate({_id:'rs0', members:[{_id:0, host:'mongodb.default.svc.cluster.local:27017'}]})"
+```
+
+> Kết quả mong đợi: `{ ok: 1 }`
+
+#### 4. Deploy microservices
+
+```powershell
 kubectl apply -f k8s/02-microservices.yaml
+kubectl get pods -w                          # Đợi tất cả Running
+```
 
-# 5. Seed 100 xe × 10 khách hàng
-kubectl exec -it $(kubectl get pod -l app=route-optimization -o jsonpath="{.items[0].metadata.name}") -- python route_optimization/seed_assigned_routes.py --count 100
+#### 5. Seed dữ liệu
 
-# 6. Mở dashboard
-kubectl port-forward svc/dashboard-frontend 3000:5173
-# → http://localhost:3000
+```powershell
+kubectl exec -it deployment/route-optimization -- python seed_assigned_routes.py --count 100
+```
+
+#### 6. Truy cập Dashboard
+
+```powershell
+# Terminal 1
+kubectl port-forward svc/dashboard-backend 4000:4000
+
+# Terminal 2
+kubectl port-forward svc/dashboard-frontend 5173:5173
+```
+
+→ Mở **http://localhost:5173**
+
+#### Rebuild khi sửa code
+
+```powershell
+docker build -t logictics-opt:v6 -f Dockerfile.route_optimization .
+kubectl rollout restart deployment/route-optimization
 ```
 
 ---
 
-## 5. Chạy với Docker Compose
+### Option 2: Docker Compose
 
-```bash
+```powershell
 cd infrastructure
 docker-compose up -d --build
 
 # Seed data
 docker compose exec route_optimization python route_optimization/seed_assigned_routes.py --count 100
-
-# Dashboard: http://localhost:5173
 ```
+
+→ Mở **http://localhost:5173**
 
 ---
 
-## 6. Tạo tuyến đường tối ưu cho 100 xe
+## Xử lý sự cố
 
-### Seed dữ liệu
+| Lỗi                          | Nguyên nhân                  | Fix                                           |
+| ---------------------------- | ---------------------------- | --------------------------------------------- |
+| `ImagePullBackOff`           | Image không tồn tại local    | Kiểm tra `docker images`, build lại nếu thiếu |
+| `CrashLoopBackOff`           | Dependency chưa sẵn sàng     | Đảm bảo infrastructure pods Running trước     |
+| `container not found`        | Pod chưa start               | `kubectl logs <pod>` → check lỗi              |
+| MongoDB `rs.initiate` fail   | Pod chưa Ready               | Đợi Running rồi thử lại                       |
+| `REDIS_PORT=tcp://...` crash | K8s inject biến service link | Đã fix bằng `enableServiceLinks: false`       |
 
-```bash
-python route_optimization/seed_assigned_routes.py --count 100
-```
+---
 
-Tạo 100 document trong MongoDB `traffic_system.assigned_routes`:
-
-```json
-{
-  "vehicle_id": "Truck_001",
-  "assigned_route": ["E_101_TrucBach", "E_102_HangBong", ...],
-  "remaining_customers": [
-    {"cust_id": "Cust_T001_1", "latitude": 21.033, "longitude": 105.849},
-    {"cust_id": "Cust_T001_2", "latitude": 21.028, "longitude": 105.832},
-    ... // 10 khách hàng
-  ]
-}
-```
-
-### Chạy tối ưu
-
-Service `route-optimization` tự động:
-
-1. Đọc 100 xe từ MongoDB
-2. Với mỗi xe: GA tối ưu thứ tự 10 khách → Dijkstra tính đường
-3. Ghi `new_assigned_route` (danh sách edge_id liên tục) + `estimated_total_travel_time`
-4. Dashboard nhận realtime qua Change Stream
-
-### Xem kết quả trên Dashboard
+## Kết quả
 
 - Click xe trên map → hiển thị tuyến đường tối ưu (nét đậm, cùng màu xe)
 - Panel trái: danh sách 100 xe, ETA, số cạnh đường
 - Traffic layer: xanh/cam/đỏ theo mức độ tắc nghẽn
-
-### Reset & chạy lại GA
-
-```bash
-python route_optimization/seed_assigned_routes.py --count 100 --reset
-```
-
-Xóa `new_assigned_route` → GA tính lại từ đầu với traffic mới nhất.
+- Route tự động cập nhật khi phát hiện tắc đường mới

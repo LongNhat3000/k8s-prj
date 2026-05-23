@@ -13,6 +13,7 @@ spec:
       labels:
         app: bot-simulator
     spec:
+      enableServiceLinks: false
       containers:
         - name: bot-simulator
           image: logictics-bot:latest
@@ -38,6 +39,7 @@ spec:
       labels:
         app: stream-processing
     spec:
+      enableServiceLinks: false
       containers:
         - name: stream-processing
           image: logictics-stream:v5
@@ -47,7 +49,7 @@ spec:
               value: "kafka.default.svc.cluster.local:9092"
             - name: REDIS_HOST
               value: "redis.default.svc.cluster.local"
-            - name: REDIS_PORT
+            - name: REDIS_PORT_NUM
               value: "6379"
             - name: EDGES_JSON
               value: "/app/data/edges_schema.json"
@@ -69,9 +71,10 @@ spec:
       labels:
         app: route-optimization
     spec:
+      enableServiceLinks: false
       containers:
         - name: route-optimization
-          image: logictics-opt:v4
+          image: logictics-opt:v6
           imagePullPolicy: IfNotPresent
           env:
             - name: PYTHONUNBUFFERED
@@ -91,7 +94,7 @@ kind: Service
 metadata:
   name: dashboard-backend
 spec:
-  type: NodePort # Mở cổng để trình duyệt ở ngoài máy tính có thể chọc vào
+  type: NodePort
   selector:
     app: dashboard-backend
   ports:
@@ -113,6 +116,7 @@ spec:
       labels:
         app: dashboard-backend
     spec:
+      enableServiceLinks: false
       containers:
         - name: dashboard-backend
           image: logictics-backend:v7
@@ -157,6 +161,7 @@ spec:
       labels:
         app: dashboard-frontend
     spec:
+      enableServiceLinks: false
       containers:
         - name: dashboard-frontend
           image: logictics-frontend:v4
