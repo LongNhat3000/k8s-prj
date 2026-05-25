@@ -169,6 +169,33 @@ kubectl port-forward svc/dashboard-backend 4000:4000
 kubectl port-forward svc/dashboard-frontend 5173:5173
 ```
 
+### 7. Dừng k8s
+
+kubectl delete -f k8s/02-microservices.yaml
+kubectl delete -f k8s/01-infrastructure.yaml
+
+### 8. Kiểm tra log
+
+# Log bot simulation (xem có gửi edge_id không)
+
+kubectl logs deployment/bot-simulator --tail=20
+
+# Log stream-processing (xem Spark còn stuck không)
+
+kubectl logs deployment/stream-processing --tail=50 | findstr /V "WARN"
+
+# Log backend (xem kết nối Redis/Mongo/Kafka)
+
+kubectl logs deployment/dashboard-backend --tail=30
+
+# Log route-optimization (xem GA có chạy không)
+
+kubectl logs deployment/route-optimization --tail=20
+
+# Kiểm tra Redis có data traffic chưa
+
+kubectl exec -it deployment/redis -- redis-cli KEYS "edge:\*" | Select-Object -First 10
+
 → Mở **http://localhost:5173**
 
 #### Rebuild khi sửa code

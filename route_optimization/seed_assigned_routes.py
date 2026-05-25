@@ -37,15 +37,17 @@ def load_edges(path: str) -> List[Dict[str, Any]]:
 def build_doc_for_truck(edges: List[Dict[str, Any]], index: int) -> Dict[str, Any]:
     """index: 1-based truck index (Truck_001, ...)."""
     n = len(edges)
-    span = min(6, n)
+    span = min(15, n)
     off = ((index - 1) * 13) % max(1, n - span)
     chunk = edges[off : off + span]
     eids = [e["edge_id"] for e in chunk]
     if len(eids) < 2:
         raise SystemExit("edges_schema quá ngắn")
 
+    # Tạo 10 khách hàng cho mỗi xe
     custs = []
-    for j, e in enumerate(chunk[1:4]):
+    num_customers = min(10, len(chunk) - 1)
+    for j, e in enumerate(chunk[1 : num_customers + 1]):
         sn = e.get("start_node") or {}
         lat, lon = sn.get("lat"), sn.get("lon")
         if lat is None or lon is None:
@@ -55,6 +57,8 @@ def build_doc_for_truck(edges: List[Dict[str, Any]], index: int) -> Dict[str, An
                 "cust_id": f"Cust_T{index:03d}_{j+1}",
                 "latitude": float(lat),
                 "longitude": float(lon),
+                "order": j + 1,
+                "status": "pending",
             }
         )
     if not custs:
@@ -63,6 +67,8 @@ def build_doc_for_truck(edges: List[Dict[str, Any]], index: int) -> Dict[str, An
                 "cust_id": f"Cust_T{index:03d}_1",
                 "latitude": float(chunk[0]["start_node"]["lat"]),
                 "longitude": float(chunk[0]["start_node"]["lon"]),
+                "order": 1,
+                "status": "next",
             }
         )
 
@@ -76,6 +82,9 @@ def build_doc_for_truck(edges: List[Dict[str, Any]], index: int) -> Dict[str, An
         "distance_on_edge": 0.0,
         "assigned_route": eids[: max(2, len(eids))],
         "remaining_customers": custs,
+        "customers": custs,
+        "current_edge_index": 0,
+        "total_edges": len(eids),
     }
 
 

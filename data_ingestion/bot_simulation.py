@@ -6,8 +6,8 @@ import heapq
 from kafka_producer import GPSProducer
 
 # --- BIẾN TOÀN CỤC MÔ PHỎNG VẬT LÝ ---
-RHO_MAX = 250  
-V_MIN = 2.5    
+RHO_MAX = 250       # Mật độ tối đa (xe/km) — đường đô thị HN
+V_MIN = 8.0         # Tốc độ tối thiểu khi tắc nặng (km/h) — thực tế HN: 5-8
 edge_vehicle_count = {} 
 STUCK_TIMEOUT = 3
 
@@ -16,6 +16,9 @@ ATTRACTOR_EDGES = []
 # --- GRAPH LOOKUP ---
 edge_by_id = {}       # edge_id → edge object
 graph_adj = {}        # node_id → [edge, ...]
+
+# --- MONGODB ROUTES (cho Truck) ---
+mongo_routes = {}     # vehicle_id → list of edge_ids từ MongoDB
 
 
 def load_map_graph(edges_filepath):
@@ -34,15 +37,49 @@ def load_map_graph(edges_filepath):
         graph_adj[start].append(edge)
     
     global ATTRACTOR_EDGES
-    ATTRACTOR_EDGES = random.sample(edges, min(15, len(edges)))
+    ATTRACTOR_EDGES = random.sample(edges, min(40, len(edges)))
     print(f"Đã nạp {len(edges)} edges, {len(graph_adj)} nodes.")
     print(f"Đã thiết lập {len(ATTRACTOR_EDGES)} trung tâm thu hút giao thông.")
         
     return edges
 
 
+def load_routes_from_mongo():
+    """
+    Đọc routes từ MongoDB (new_assigned_route hoặc assigned_route)
+    để Truck đi đúng route hiển thị trên dashboard.
+    """
+    global mongo_routes
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://mongodb:27017/")
+    
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+        db = client["traffic_system"]
+        coll = db["assigned_routes"]
+        
+        count = 0
+        for doc in coll.find({"vehicle_id": {"$regex": "^Truck_"}}):
+            vid = doc["vehicle_id"]
+            # Ưu tiên new_assigned_route (GA đã tối ưu), fallback assigned_route
+            route = doc.get("new_assigned_route") or doc.get("assigned_route") or []
+            if route and len(route) >= 2:
+                # Validate: chỉ giữ edge_ids tồn tại trong graph
+                valid_route = [eid for eid in route if eid in edge_by_id]
+                if len(valid_route) >= 2:
+                    mongo_routes[vid] = valid_route
+                    count += 1
+        
+        client.close()
+        print(f"✅ Đã tải {count} routes từ MongoDB cho Trucks.")
+        
+    except Exception as e:
+        print(f"⚠️ Không kết nối được MongoDB: {e}")
+        print("   → Trucks sẽ dùng Dijkstra fallback (route có thể khác dashboard).")
+
+
 # ============================================================
-# DIJKSTRA SHORTEST PATH
+# DIJKSTRA SHORTEST PATH (fallback khi không có MongoDB route)
 # ============================================================
 
 def dijkstra(start_node_id, end_node_id):
@@ -124,22 +161,22 @@ class Vehicle:
 
     def _spawn(self):
         """Khởi tạo xe lần đầu hoặc khi hoàn thành nhiệm vụ."""
-        self.current_edge = random.choices(self.all_edges, weights=Vehicle.cached_edge_lengths, k=1)[0]
-        self.latitude = self.current_edge['start_node']['lat']
-        self.longitude = self.current_edge['start_node']['lon']
-        self.progress_meters = 0.0
-        self.speed = self.current_edge['max_speed_kmh']
-        self.stuck_count = 0
-        edge_vehicle_count[self.current_edge['edge_id']] += 1
-        
         if self.entity_type == "Truck":
             self._init_truck_route()
         else:
+            # Bot: spawn ngẫu nhiên
+            self.current_edge = random.choices(self.all_edges, weights=Vehicle.cached_edge_lengths, k=1)[0]
+            self.latitude = self.current_edge['start_node']['lat']
+            self.longitude = self.current_edge['start_node']['lon']
+            self.progress_meters = 0.0
+            self.speed = self.current_edge['max_speed_kmh']
+            self.stuck_count = 0
+            edge_vehicle_count[self.current_edge['edge_id']] += 1
             self._init_bot_target()
 
     def _init_bot_target(self):
-        """Bot: chọn 1 đích ngẫu nhiên, 40% vào điểm nóng."""
-        if random.random() < 0.40:
+        """Bot: chọn 1 đích ngẫu nhiên, 20% vào điểm nóng."""
+        if random.random() < 0.20:
             self.target_edge = random.choice(ATTRACTOR_EDGES)
         else:
             self.target_edge = random.choice(self.all_edges)
@@ -148,29 +185,48 @@ class Vehicle:
 
     def _init_truck_route(self):
         """
-        Truck: chọn 10 khách hàng ngẫu nhiên → tính Dijkstra shortest-path
-        liên tục qua tất cả → xe ĐI ĐÚNG TỪNG EDGE trong route.
+        Truck: đọc route từ MongoDB (đã load vào mongo_routes).
+        Nếu không có → fallback Dijkstra tự tính.
+        Xe SPAWN TẠI edge đầu tiên của route → đi đúng đường trên dashboard.
         """
-        # Chọn 10 customer edges ngẫu nhiên
+        vid = self.entity_id
+        
+        if vid in mongo_routes:
+            # ĐỌC ROUTE TỪ MONGODB — đi đúng đường hiển thị trên frontend
+            route_edge_ids = mongo_routes[vid]
+            self._route_edges = [edge_by_id[eid] for eid in route_edge_ids]
+            self._route_index = 0
+            
+            # Spawn tại edge đầu tiên
+            first_edge = self._route_edges[0]
+            self.current_edge = first_edge
+            self.latitude = first_edge['start_node']['lat']
+            self.longitude = first_edge['start_node']['lon']
+            self.progress_meters = 0.0
+            self.speed = first_edge['max_speed_kmh']
+            self.stuck_count = 0
+            edge_vehicle_count[first_edge['edge_id']] += 1
+            
+        else:
+            # FALLBACK: không có route trong MongoDB → tự tính Dijkstra
+            self.current_edge = random.choices(self.all_edges, weights=Vehicle.cached_edge_lengths, k=1)[0]
+            self.latitude = self.current_edge['start_node']['lat']
+            self.longitude = self.current_edge['start_node']['lon']
+            self.progress_meters = 0.0
+            self.speed = self.current_edge['max_speed_kmh']
+            self.stuck_count = 0
+            edge_vehicle_count[self.current_edge['edge_id']] += 1
+            self._fallback_dijkstra_route()
+
+    def _fallback_dijkstra_route(self):
+        """Fallback: tính Dijkstra route khi không có MongoDB data."""
         customer_edges = random.sample(self.all_edges, min(10, len(self.all_edges)))
         
-        self.customer_route = []
-        for idx, edge in enumerate(customer_edges):
-            self.customer_route.append({
-                "cust_id": f"Cust_{self.entity_id}_{idx+1}",
-                "latitude": edge['start_node']['lat'],
-                "longitude": edge['start_node']['lon']
-            })
-        
-        # Tính Dijkstra liên tục: current_position → customer1 → customer2 → ... → customer10
         current_node = self.current_edge['end_node']['node_id']
         full_route = []
-        
-        # Greedy nearest-customer ordering (tối ưu thứ tự đơn giản)
         unvisited = list(range(len(customer_edges)))
         
         while unvisited:
-            # Tìm customer gần nhất
             best_idx = unvisited[0]
             best_dist = float('inf')
             cur_coords = graph_adj.get(current_node, [{}])
@@ -190,18 +246,14 @@ class Vehicle:
             unvisited.remove(best_idx)
             target_node = customer_edges[best_idx]['start_node']['node_id']
             
-            # Dijkstra current → target
             segment = dijkstra(current_node, target_node)
             if segment:
                 full_route.extend(segment)
                 current_node = target_node
-            # else: skip unreachable customer
         
-        # Lưu route edge sequence — xe sẽ đi ĐÚNG từng edge này
-        self._route_edges = full_route
+        self._route_edges = full_route if full_route else None
         self._route_index = 0
         
-        # Nếu route rỗng (tất cả khách unreachable) → fallback random walk
         if not self._route_edges:
             self._route_edges = None
             self.target_edge = random.choice(self.all_edges)
@@ -213,7 +265,9 @@ class Vehicle:
         
         # 1. Greenshields tính vận tốc
         n_vehicles = edge_vehicle_count[edge_id]
-        density = n_vehicles / (length_m / 1000) if length_m > 0 else 0
+        # Minimum capacity: edge ngắn (<60m) vẫn chứa ít nhất 15 xe trước khi tắc
+        effective_length_km = max(length_m / 1000, 15.0 / RHO_MAX)
+        density = n_vehicles / effective_length_km if length_m > 0 else 0
         if density >= RHO_MAX:
             self.speed = V_MIN
         else:
@@ -239,19 +293,21 @@ class Vehicle:
             self.longitude = s['lon'] + (e['lon'] - s['lon']) * ratio
 
     def _move_truck_on_route(self):
-        """Truck đi theo route Dijkstra đã tính sẵn — từng edge một."""
+        """Truck đi theo route từ MongoDB — từng edge một."""
         self._route_index += 1
         
         if self._route_index >= len(self._route_edges):
-            # Hoàn thành toàn bộ route → respawn
-            self._spawn()
+            # Hoàn thành toàn bộ route → quay lại từ đầu (loop)
+            self._route_index = 0
+            first_edge = self._route_edges[0]
+            self._enter_edge(first_edge)
             return
         
         next_edge = self._route_edges[self._route_index]
         
         # Gatekeeping: kiểm tra edge tiếp theo có đầy không
         next_length = next_edge['length_meters']
-        next_capacity = RHO_MAX * (next_length / 1000)
+        next_capacity = max(15, RHO_MAX * (next_length / 1000))
         
         if edge_vehicle_count[next_edge['edge_id']] >= next_capacity:
             # Chờ tại ngã tư — giữ nguyên vị trí
@@ -266,8 +322,7 @@ class Vehicle:
                 self.stuck_count = 0
                 self._route_index += 1
                 if self._route_index >= len(self._route_edges):
-                    self._spawn()
-                    return
+                    self._route_index = 0
                 next_edge = self._route_edges[self._route_index]
                 self._enter_edge(next_edge)
         else:
@@ -302,7 +357,7 @@ class Vehicle:
         
         # Gatekeeping
         next_length = best_edge['length_meters']
-        next_capacity = RHO_MAX * (next_length / 1000)
+        next_capacity = max(15, RHO_MAX * (next_length / 1000))
         
         if edge_vehicle_count[best_edge['edge_id']] >= next_capacity:
             self.progress_meters = self.current_edge['length_meters']
@@ -346,15 +401,26 @@ if __name__ == "__main__":
     edges_path = os.path.join(BASE_DIR, "data", "edges_schema.json")
     all_edges = load_map_graph(edges_path)
     
+    # Tải routes từ MongoDB TRƯỚC khi khởi tạo Trucks
+    print("Đang tải routes từ MongoDB...")
+    load_routes_from_mongo()
+    
     producer = GPSProducer()
     
-    print("Đang khởi tạo 9.900 Bots và 100 Trucks (Dijkstra routing)...")
-    vehicles = [Vehicle(f"Bot_{i:04d}", "Bot", all_edges) for i in range(1, 9901)]
+    NUM_BOTS = int(os.getenv("NUM_BOTS", "3000"))
+    TICK_INTERVAL = float(os.getenv("TICK_INTERVAL", "2.0"))
     
-    print("Tính Dijkstra route cho 100 Trucks (mỗi xe 10 khách)...")
+    print(f"Đang khởi tạo {NUM_BOTS} Bots và 100 Trucks (interval={TICK_INTERVAL}s)...")
+    vehicles = [Vehicle(f"Bot_{i:04d}", "Bot", all_edges) for i in range(1, NUM_BOTS + 1)]
+    
+    print("Khởi tạo 100 Trucks (đi theo route MongoDB)...")
     trucks = [Vehicle(f"Truck_{i:03d}", "Truck", all_edges) for i in range(1, 101)]
     vehicles.extend(trucks)
-    print(f"✅ Khởi tạo xong. Trung bình {sum(len(t._route_edges or []) for t in trucks) // 100} edges/truck.")
+    
+    mongo_count = sum(1 for t in trucks if t._route_edges and t.entity_id in mongo_routes)
+    fallback_count = len(trucks) - mongo_count
+    print(f"✅ {mongo_count} Trucks dùng route MongoDB, {fallback_count} Trucks dùng Dijkstra fallback.")
+    print(f"   Trung bình {sum(len(t._route_edges or []) for t in trucks) // max(1, len(trucks))} edges/truck.")
     
     print("Bắt đầu mô phỏng giao thông thời gian thực! (Ctrl+C để dừng)")
     try:
@@ -367,7 +433,7 @@ if __name__ == "__main__":
             producer.flush()
             
             elapsed = time.time() - start_time
-            sleep_time = max(0, 1.0 - elapsed)
+            sleep_time = max(0, TICK_INTERVAL - elapsed)
             time.sleep(sleep_time)
             
     except KeyboardInterrupt:

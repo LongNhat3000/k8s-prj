@@ -90,6 +90,7 @@ async function runKafkaForever() {
 
       // Buffer để batch emit vehicle_update mỗi 1s
       let vehicleBuffer = {};
+      let edgeUpdateBuffer = {};  // vehicle_id → edge_id (batch update MongoDB mỗi 5s)
       setInterval(() => {
         const batch = Object.values(vehicleBuffer);
         if (batch.length > 0) {
@@ -97,6 +98,25 @@ async function runKafkaForever() {
           vehicleBuffer = {};
         }
       }, 1000);
+
+      // Batch update current_edge_id vào MongoDB mỗi 5s
+      setInterval(async () => {
+        if (!mongoReady) return;
+        const updates = Object.entries(edgeUpdateBuffer);
+        if (updates.length === 0) return;
+        edgeUpdateBuffer = {};
+        
+        const bulkOps = updates.map(([vehicle_id, edge_id]) => ({
+          updateOne: {
+            filter: { vehicle_id },
+            update: { $set: { current_edge_id: edge_id, edge_id: edge_id } },
+          }
+        }));
+        
+        try {
+          await RouteModel.bulkWrite(bulkOps, { ordered: false });
+        } catch (e) { /* ignore - best effort */ }
+      }, 5000);
 
       await consumer.run({
         eachMessage: async ({ message }) => {
@@ -110,6 +130,10 @@ async function runKafkaForever() {
                 lon: data.longitude,
                 speed: data.speed
               };
+              // Track edge_id cho batch update MongoDB
+              if (data.edge_id) {
+                edgeUpdateBuffer[data.entity_id] = data.edge_id;
+              }
             }
           } catch (e) { console.error("Lỗi parse Kafka:", e.message); }
         },
@@ -133,6 +157,14 @@ const RouteModel = mongoose.model("Route", new mongoose.Schema({
   remaining_customers: [{
     cust_id: String, latitude: Number, longitude: Number
   }],
+  customers: [{
+    cust_id: String, latitude: Number, longitude: Number,
+    order: Number, status: String
+  }],
+  current_edge_index: Number,
+  total_edges: Number,
+  rerouted: Boolean,
+  reroute_reason: String,
   estimated_total_travel_time: Number,
 }), "assigned_routes");
 
@@ -145,6 +177,11 @@ function setupChangeStreams() {
           vehicle_id: updatedData.vehicle_id,
           path: updatedData.new_assigned_route,
           time: updatedData.estimated_total_travel_time,
+          customers: updatedData.customers || [],
+          current_edge_index: updatedData.current_edge_index || 0,
+          total_edges: updatedData.total_edges || 0,
+          rerouted: updatedData.rerouted || false,
+          reroute_reason: updatedData.reroute_reason || "",
         });
       }
     });
@@ -159,18 +196,25 @@ async function emitRoutesSnapshot(socket) {
   try {
     const docs = await RouteModel.find({
       vehicle_id: { $exists: true, $nin: [null, ""] },
-      "new_assigned_route.0": { $exists: true },
     })
-      .select("vehicle_id new_assigned_route estimated_total_travel_time")
+      .select("vehicle_id new_assigned_route assigned_route estimated_total_travel_time customers current_edge_index total_edges")
       .lean();
     const payload = docs
-      .filter((d) => d.vehicle_id && Array.isArray(d.new_assigned_route) && d.new_assigned_route.length)
+      .filter((d) => {
+        if (!d.vehicle_id) return false;
+        const route = d.new_assigned_route || d.assigned_route || [];
+        return Array.isArray(route) && route.length > 0;
+      })
       .map((d) => ({
         vehicle_id: d.vehicle_id,
-        path: d.new_assigned_route,
+        path: d.new_assigned_route && d.new_assigned_route.length > 0 ? d.new_assigned_route : d.assigned_route || [],
         time: d.estimated_total_travel_time,
+        customers: d.customers || [],
+        current_edge_index: d.current_edge_index || 0,
+        total_edges: d.total_edges || 0,
       }));
     socket.emit("routes_snapshot", payload);
+    console.log(`📦 routes_snapshot: ${payload.length} routes, ${payload.filter(p => p.customers.length > 0).length} with customers`);
   } catch (e) {
     console.error("routes_snapshot:", e.message);
   }
@@ -199,10 +243,12 @@ io.on("connection", (socket) => {
 
       // Lấy customers từ MongoDB (remaining_customers trong assigned_routes)
       let customers = [];
+      let customersForFrontend = [];
       if (mongoReady) {
         const doc = await RouteModel.findOne({ vehicle_id }).lean();
-        if (doc && doc.remaining_customers && doc.remaining_customers.length > 0) {
-          customers = doc.remaining_customers;
+        if (doc) {
+          customers = doc.remaining_customers || doc.customers || [];
+          customersForFrontend = doc.customers || doc.remaining_customers || [];
         }
       }
 
@@ -233,6 +279,9 @@ io.on("connection", (socket) => {
         vehicle_id,
         path: result.path,
         time: Math.round(result.totalCost),
+        customers: customersForFrontend,
+        current_edge_index: 0,
+        total_edges: result.path.length,
       });
       console.log(`🗺️ Route calculated for ${vehicle_id}: ${result.path.length} edges, ${Math.round(result.totalCost)}s`);
     } catch (err) {

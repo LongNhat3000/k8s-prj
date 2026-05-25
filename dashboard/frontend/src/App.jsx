@@ -265,7 +265,15 @@ function App() {
         if (!vid) continue;
         const path = item.path || [];
         if (path.length === 0) { delete next[vid]; continue; }
-        next[vid] = { path, time: item.time };
+        next[vid] = {
+          path,
+          time: item.time,
+          customers: item.customers || [],
+          current_edge_index: item.current_edge_index || 0,
+          total_edges: item.total_edges || path.length,
+          rerouted: item.rerouted || false,
+          reroute_reason: item.reroute_reason || "",
+        };
       }
       return next;
     });
@@ -301,9 +309,15 @@ function App() {
     socket.on("routes_snapshot", (payload) => { mergeRoutes(payload); });
     socket.on("route_optimized", (data) => { mergeRoutes([data]); });
     socket.on("route_result", (data) => {
-      if (data && data.vehicle_id && data.path && data.path.length > 0) {
-        mergeRoutes([{ vehicle_id: data.vehicle_id, path: data.path, time: data.time }]);
-      }
+      if (!data || !data.vehicle_id || !data.path || data.path.length === 0) return;
+      // route_result (on-demand PathFinder) — CHỈ dùng nếu xe hoàn toàn chưa có route
+      setRoutesByVehicle((prev) => {
+        // Nếu đã có route (từ snapshot/GA) → KHÔNG ghi đè, giữ nguyên 100%
+        if (prev[data.vehicle_id]?.path?.length > 0) return prev;
+        const next = { ...prev };
+        next[data.vehicle_id] = { path: data.path, time: data.time, customers: data.customers || [], current_edge_index: data.current_edge_index || 0, total_edges: data.total_edges || data.path.length, rerouted: false, reroute_reason: "" };
+        return next;
+      });
     });
 
     return () => {
@@ -337,7 +351,8 @@ function App() {
     (vid) => {
       setSelectedVehicleId((prev) => {
         const newSelected = prev === vid ? null : vid;
-        if (newSelected && socketRef.current) {
+        // Chỉ request route on-demand nếu xe CHƯA CÓ route từ MongoDB
+        if (newSelected && socketRef.current && !routesByVehicle[newSelected]?.path?.length) {
           const v = vehicles[newSelected];
           if (v && v.lat && v.lon) {
             socketRef.current.emit("request_route", { vehicle_id: newSelected, lat: v.lat, lon: v.lon });
@@ -346,7 +361,7 @@ function App() {
         return newSelected;
       });
     },
-    [vehicles]
+    [vehicles, routesByVehicle]
   );
 
   return (
@@ -456,25 +471,76 @@ function App() {
         {/* Traffic layer: Canvas trực tiếp — KHÔNG qua React DOM */}
         <CanvasTrafficLayer trafficRef={trafficRef} />
 
-        {/* Route layer: chỉ xe đang chọn */}
+        {/* Route layer: 2 màu — đã đi (mờ) + chưa đi (đậm) */}
         {selectedVehicleId && routesByVehicle[selectedVehicleId] && (() => {
           const r = routesByVehicle[selectedVehicleId];
-          const segments = pathToSegments(r.path, edgeLookup);
           const color = hashHue(selectedVehicleId);
-          return segments.map((seg, idx) => (
-            <Polyline
-              key={`route-seg-${idx}`}
-              positions={seg}
-              pathOptions={{ color, weight: 7, opacity: 1 }}
-            >
-              {idx === 0 && (
+          const edgeIndex = r.current_edge_index || 0;
+          const passedPath = r.path.slice(0, edgeIndex);
+          const remainingPath = r.path.slice(edgeIndex);
+          const passedSegments = pathToSegments(passedPath, edgeLookup);
+          const remainingSegments = pathToSegments(remainingPath, edgeLookup);
+
+          return (
+            <>
+              {/* Đoạn đã đi — mờ */}
+              {passedSegments.map((seg, idx) => (
+                <Polyline
+                  key={`passed-${idx}`}
+                  positions={seg}
+                  pathOptions={{ color: "#9ca3af", weight: 4, opacity: 0.4, dashArray: "8 6" }}
+                />
+              ))}
+              {/* Đoạn chưa đi — đậm */}
+              {remainingSegments.map((seg, idx) => (
+                <Polyline
+                  key={`remain-${idx}`}
+                  positions={seg}
+                  pathOptions={{ color, weight: 7, opacity: 1 }}
+                >
+                  {idx === 0 && (
+                    <Popup>
+                      {selectedVehicleId}<br />
+                      ETA: {formatEtaMinutes(r.time)}
+                      {r.rerouted && r.reroute_reason && (
+                        <><br /><span style={{ color: "#ef4444" }}>⚠️ {r.reroute_reason}</span></>
+                      )}
+                    </Popup>
+                  )}
+                </Polyline>
+              ))}
+            </>
+          );
+        })()}
+
+        {/* Customer markers: chỉ hiện khi chọn xe */}
+        {selectedVehicleId && routesByVehicle[selectedVehicleId]?.customers?.length > 0 && (() => {
+          const customers = routesByVehicle[selectedVehicleId].customers;
+          return customers.map((cust) => {
+            const status = cust.status || "pending";
+            let emoji = "🔴";
+            let size = 28;
+            if (status === "next") { emoji = "📍"; size = 36; }
+            else if (status === "delivered") { emoji = "✅"; size = 24; }
+
+            const icon = L.divIcon({
+              className: `customer-marker customer-${status}`,
+              html: `<div style="font-size:${size}px;text-align:center;line-height:1">${emoji}</div>`
+                + `<div style="font-size:10px;text-align:center;color:#333;font-weight:600;margin-top:2px">${cust.order || ""}</div>`,
+              iconSize: [40, 48],
+              iconAnchor: [20, 44],
+            });
+
+            return (
+              <Marker key={cust.cust_id} position={[cust.latitude, cust.longitude]} icon={icon}>
                 <Popup>
-                  {selectedVehicleId}<br />
-                  ETA: {formatEtaMinutes(r.time)}
+                  <strong>{cust.cust_id}</strong><br />
+                  Thứ tự: {cust.order}<br />
+                  Trạng thái: {status === "delivered" ? "Đã giao" : status === "next" ? "Đang tới" : "Chờ giao"}
                 </Popup>
-              )}
-            </Polyline>
-          ));
+              </Marker>
+            );
+          });
         })()}
 
         {/* Truck markers */}

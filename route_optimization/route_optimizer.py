@@ -34,10 +34,13 @@ from optimizer_input_adapter import (
 from genetic_algorithm import run_genetic_algorithm
 
 
-DEFAULT_MIN_AVG_SPEED = 5.0
+DEFAULT_MIN_AVG_SPEED = 10.0   # Đồng bộ với CONGESTION_THRESHOLD_KMH = 10
 DEFAULT_POPULATION_SIZE = 30
 DEFAULT_GENERATIONS = 60
 DEFAULT_MUTATION_RATE = 0.15
+REROUTE_COOLDOWN_SEC = 60      # Tối thiểu 60s giữa 2 lần re-route cùng xe
+
+_last_reroute_time = {}        # vehicle_id → timestamp (epoch seconds)
 
 
 def now_ms() -> int:
@@ -137,6 +140,8 @@ def save_optimization_result_to_mongo(
     ga_result: Dict[str, Any],
     old_assigned_route: list,
     new_assigned_route: list,
+    customers: list = None,
+    reroute_reason: str = "",
 ) -> bool:
     """
     Cap nhat ket qua optimization vao MongoDB theo schema dashboard.
@@ -151,12 +156,35 @@ def save_optimization_result_to_mongo(
     """
     estimated_total_travel_time = ga_result.get("estimated_total_cost", 0)
 
+    # Xây dựng customers với status cho Frontend
+    customers_with_status = []
+    optimized_customers = ga_result.get("optimized_customers", [])
+    if optimized_customers:
+        for idx, cust in enumerate(optimized_customers):
+            customers_with_status.append({
+                "cust_id": cust.get("cust_id", f"Cust_{idx+1}"),
+                "latitude": cust.get("latitude", 0),
+                "longitude": cust.get("longitude", 0),
+                "order": idx + 1,
+                "status": "pending",  # pending | next | delivered
+            })
+        # Đánh dấu customer đầu tiên là "next"
+        if customers_with_status:
+            customers_with_status[0]["status"] = "next"
+    elif customers:
+        customers_with_status = customers
+
     update_doc = {
         "$set": {
             "vehicle_id": vehicle_id,
             "new_assigned_route": new_assigned_route,
             "estimated_total_travel_time": estimated_total_travel_time,
             "optimized_customer_order": ga_result.get("optimized_customer_order", []),
+            "customers": customers_with_status,
+            "current_edge_index": 0,
+            "total_edges": len(new_assigned_route),
+            "rerouted": True,
+            "reroute_reason": reroute_reason,
             "optimization_result": {
                 "old_assigned_route": old_assigned_route,
                 "new_assigned_route": new_assigned_route,
@@ -165,7 +193,6 @@ def save_optimization_result_to_mongo(
                 "generation_count": ga_result.get("generation_count"),
                 "optimized_at": now_ms(),
                 "algorithm": "Genetic Algorithm",
-                "note": "new_assigned_route currently falls back to old_assigned_route until graph pathfinding is implemented",
             },
             "last_optimized_at": now_ms(),
             "route_status": "optimized",
@@ -209,6 +236,15 @@ def optimize_vehicle(
 
         old_assigned_route = opt_input.get("assigned_route", [])
 
+        # Cooldown: không re-route liên tục cho cùng 1 xe
+        if not force:
+            last_time = _last_reroute_time.get(vehicle_id, 0)
+            if time.time() - last_time < REROUTE_COOLDOWN_SEC:
+                return build_no_reroute_response(
+                    vehicle_id=vehicle_id,
+                    reason=f"Cooldown: chờ {REROUTE_COOLDOWN_SEC}s giữa 2 lần re-route",
+                )
+
         reroute_needed = should_trigger_reroute(
             normalized_input=opt_input,
             min_avg_speed=min_avg_speed,
@@ -235,6 +271,14 @@ def optimize_vehicle(
             graph=graph,
         )
 
+        # Xác định lý do re-route
+        blocked_edges = opt_input.get("blocked_edges", [])
+        reroute_reason = ""
+        if blocked_edges:
+            reroute_reason = f"Tắc nghẽn tại: {', '.join(blocked_edges[:3])}"
+        elif force:
+            reroute_reason = "Khởi tạo lần đầu"
+
         mongo_updated = False
         if mongo_collection is not None:
             mongo_updated = save_optimization_result_to_mongo(
@@ -243,7 +287,12 @@ def optimize_vehicle(
                 ga_result=ga_result,
                 old_assigned_route=old_assigned_route,
                 new_assigned_route=new_assigned_route,
+                customers=opt_input.get("remaining_customers", []),
+                reroute_reason=reroute_reason,
             )
+
+        # Ghi lại thời điểm re-route
+        _last_reroute_time[vehicle_id] = time.time()
 
         return build_success_response(
             vehicle_id=vehicle_id,

@@ -2,7 +2,7 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir confluent-kafka
+RUN pip install --no-cache-dir confluent-kafka pymongo
 
 COPY data/ ./data/
 COPY data_ingestion/ ./data_ingestion/

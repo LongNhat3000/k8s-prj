@@ -11,6 +11,7 @@ Xây dựng lộ trình LIỀN MẠCH (danh sách edge_id liên tục) từ:
 1. edge[i].end_node == edge[i+1].start_node (liền mạch)
 2. Nếu không tìm được đường → bỏ qua customer đó, tiếp tục
 3. Tránh lặp edge (dedup liên tiếp)
+4. Route BẮT ĐẦU bằng start_edge (để frontend vẽ từ vị trí xe)
 """
 
 from typing import List, Dict, Optional
@@ -32,18 +33,20 @@ def build_route(
         blocked_edges: list edge_id bị chặn
         
     Returns:
-        List[str]: danh sách edge_id liên tục tạo thành lộ trình
+        List[str]: danh sách edge_id liên tục tạo thành lộ trình (bắt đầu bằng start_edge)
     """
     blocked_edges = blocked_edges or []
 
     if start_edge not in graph.edges:
         return []
 
-    route_edges: List[str] = []
     current_node = graph.edge_end_node(start_edge)
 
     if current_node is None:
         return []
+
+    # Bao gồm start_edge vào đầu route (để frontend vẽ từ vị trí xe)
+    route_edges: List[str] = [start_edge]
 
     for customer in customer_order:
         lat = customer.get("latitude")
