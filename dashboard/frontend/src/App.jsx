@@ -36,11 +36,30 @@ function formatEtaMinutes(time) {
 }
 
 /**
+ * Tính ETA dựa trên path edges khi backend trả time = 0.
+ * Dùng tổng length_meters / avg_speed để ước tính.
+ */
+function estimateEtaFromPath(path, edgeLookup) {
+  if (!path || path.length === 0) return 0;
+  let totalSeconds = 0;
+  for (const edgeId of path) {
+    const edge = edgeLookup[edgeId];
+    if (!edge) continue;
+    const lengthM = edge.length_meters || 200;
+    const speedKmh = Math.max(edge.max_speed_kmh || 30, 5);
+    const speedMs = speedKmh * 1000 / 3600;
+    totalSeconds += lengthM / speedMs;
+  }
+  return Math.round(totalSeconds);
+}
+
+/**
  * Chuyển mảng edge_id → mảng các segments (mỗi segment là mảng [lat,lng]).
  * Phát hiện gián đoạn → tách segment mới → tránh "chim bay".
  */
 function pathToSegments(path, edgeLookup) {
   if (!path || path.length === 0) return [];
+
   const segments = [];
   let currentSeg = [];
 
@@ -310,10 +329,9 @@ function App() {
     socket.on("route_optimized", (data) => { mergeRoutes([data]); });
     socket.on("route_result", (data) => {
       if (!data || !data.vehicle_id || !data.path || data.path.length === 0) return;
-      // route_result (on-demand PathFinder) — CHỈ dùng nếu xe hoàn toàn chưa có route
+      // route_result (on-demand PathFinder) — LUÔN ghi đè route cũ
+      // Vì user chủ động request route mới từ vị trí xe hiện tại
       setRoutesByVehicle((prev) => {
-        // Nếu đã có route (từ snapshot/GA) → KHÔNG ghi đè, giữ nguyên 100%
-        if (prev[data.vehicle_id]?.path?.length > 0) return prev;
         const next = { ...prev };
         next[data.vehicle_id] = { path: data.path, time: data.time, customers: data.customers || [], current_edge_index: data.current_edge_index || 0, total_edges: data.total_edges || data.path.length, rerouted: false, reroute_reason: "" };
         return next;
@@ -351,8 +369,8 @@ function App() {
     (vid) => {
       setSelectedVehicleId((prev) => {
         const newSelected = prev === vid ? null : vid;
-        // Chỉ request route on-demand nếu xe CHƯA CÓ route từ MongoDB
-        if (newSelected && socketRef.current && !routesByVehicle[newSelected]?.path?.length) {
+        // LUÔN request route mới từ vị trí xe hiện tại khi chọn xe
+        if (newSelected && socketRef.current) {
           const v = vehicles[newSelected];
           if (v && v.lat && v.lon) {
             socketRef.current.emit("request_route", { vehicle_id: newSelected, lat: v.lat, lon: v.lon });
@@ -429,7 +447,7 @@ function App() {
                     }} />
                     <strong>{vid}</strong>
                     <div style={{ color: "#555", marginTop: 2, display: "block" }}>
-                      ETA: {formatEtaMinutes(r.time)} · {r.path.length} cạnh
+                      ETA: {formatEtaMinutes(r.time || estimateEtaFromPath(r.path, edgeLookup))} · {r.path.length} cạnh
                     </div>
                   </button>
                 </li>
@@ -455,7 +473,7 @@ function App() {
           <div style={{ marginTop: 4 }}>
             <span style={{ color: selectedColor, fontWeight: 700 }}>━━</span> {selectedVehicleId}
             <br />
-            ETA: {selectedRoute ? formatEtaMinutes(selectedRoute.time) : "—"}
+            ETA: {selectedRoute ? formatEtaMinutes(selectedRoute.time || estimateEtaFromPath(selectedRoute.path, edgeLookup)) : "—"}
           </div>
         ) : (
           <div style={{ color: "#666" }}>Chọn xe ở panel trái hoặc bấm xe trên map.</div>
@@ -475,14 +493,38 @@ function App() {
         {selectedVehicleId && routesByVehicle[selectedVehicleId] && (() => {
           const r = routesByVehicle[selectedVehicleId];
           const color = hashHue(selectedVehicleId);
+
           const edgeIndex = r.current_edge_index || 0;
           const passedPath = r.path.slice(0, edgeIndex);
           const remainingPath = r.path.slice(edgeIndex);
+
+          // Tính đường nối từ xe hiện tại → start route (nét đứt)
+          const vehicle = vehicles[selectedVehicleId];
+          const firstEdgeOfRemaining = edgeLookup[remainingPath[0]];
+          let connectorLine = null;
+          if (vehicle && firstEdgeOfRemaining) {
+            const routeStart = [firstEdgeOfRemaining.start_node.lat, firstEdgeOfRemaining.start_node.lon];
+            const vehiclePos = [vehicle.lat, vehicle.lon];
+            const distDeg = Math.abs(vehiclePos[0] - routeStart[0]) + Math.abs(vehiclePos[1] - routeStart[1]);
+            // Chỉ vẽ connector nếu xe cách start route > ~50m (0.0005°)
+            if (distDeg > 0.0005) {
+              connectorLine = [vehiclePos, routeStart];
+            }
+          }
+
           const passedSegments = pathToSegments(passedPath, edgeLookup);
           const remainingSegments = pathToSegments(remainingPath, edgeLookup);
 
           return (
             <>
+              {/* Đường nối xe → start route (nét đứt, cùng màu) */}
+              {connectorLine && (
+                <Polyline
+                  key="connector-vehicle-to-route"
+                  positions={connectorLine}
+                  pathOptions={{ color, weight: 4, opacity: 0.7, dashArray: "10 8" }}
+                />
+              )}
               {/* Đoạn đã đi — mờ */}
               {passedSegments.map((seg, idx) => (
                 <Polyline
@@ -501,7 +543,7 @@ function App() {
                   {idx === 0 && (
                     <Popup>
                       {selectedVehicleId}<br />
-                      ETA: {formatEtaMinutes(r.time)}
+                      ETA: {formatEtaMinutes(r.time || estimateEtaFromPath(r.path, edgeLookup))}
                       {r.rerouted && r.reroute_reason && (
                         <><br /><span style={{ color: "#ef4444" }}>⚠️ {r.reroute_reason}</span></>
                       )}

@@ -19,6 +19,7 @@ graph_adj = {}        # node_id → [edge, ...]
 
 # --- MONGODB ROUTES (cho Truck) ---
 mongo_routes = {}     # vehicle_id → list of edge_ids từ MongoDB
+_last_route_reload = 0  # timestamp lần cuối reload routes
 
 
 def load_map_graph(edges_filepath):
@@ -76,6 +77,43 @@ def load_routes_from_mongo():
     except Exception as e:
         print(f"⚠️ Không kết nối được MongoDB: {e}")
         print("   → Trucks sẽ dùng Dijkstra fallback (route có thể khác dashboard).")
+
+
+def reload_routes_for_trucks(trucks_list):
+    """
+    Reload routes từ MongoDB và cập nhật cho trucks đang chạy.
+    Gọi định kỳ mỗi 30s để nhận route GA mới.
+    """
+    global _last_route_reload
+    now = time.time()
+    if now - _last_route_reload < 30:
+        return
+    _last_route_reload = now
+    
+    old_count = len(mongo_routes)
+    load_routes_from_mongo()
+    new_count = len(mongo_routes)
+    
+    if new_count <= old_count:
+        return
+    
+    # Cập nhật route mới cho trucks đang dùng fallback hoặc route cũ
+    updated = 0
+    for truck in trucks_list:
+        vid = truck.entity_id
+        if vid in mongo_routes:
+            new_route_ids = mongo_routes[vid]
+            new_route = [edge_by_id[eid] for eid in new_route_ids if eid in edge_by_id]
+            if len(new_route) >= 2:
+                # Chỉ update nếu route khác route hiện tại
+                old_ids = [e['edge_id'] for e in (truck._route_edges or [])]
+                if [e['edge_id'] for e in new_route] != old_ids:
+                    truck._route_edges = new_route
+                    truck._route_index = 0
+                    updated += 1
+    
+    if updated > 0:
+        print(f"🔄 Đã cập nhật route mới cho {updated} Trucks từ MongoDB (GA optimized).")
 
 
 # ============================================================
@@ -426,6 +464,10 @@ if __name__ == "__main__":
     try:
         while True:
             start_time = time.time()
+            
+            # Reload routes mới từ MongoDB mỗi 30s (nhận route GA mới)
+            reload_routes_for_trucks(trucks)
+            
             for v in vehicles:
                 v.move()
                 producer.produce_message(v.to_json_message())

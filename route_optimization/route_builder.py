@@ -81,18 +81,26 @@ def build_route(
             if not partial_route:
                 continue  # Thực sự không reachable → skip customer
 
-        # Kiểm tra liên tục: edge cuối route hiện tại → edge đầu partial
+        # Kiểm tra liên tục: edge cuối route hiện tại → edge đầu partial_route
+        # ĐẢM BẢO route liền mạch bằng cách bridge qua Dijkstra nếu có gap
         if route_edges:
             last_edge_end = graph.edge_end_node(route_edges[-1])
             first_edge_start = graph.edge_start_node(partial_route[0])
-            
-            if last_edge_end != first_edge_start:
+
+            if last_edge_end is not None and first_edge_start is not None and last_edge_end != first_edge_start:
                 # Gap! Cần bridge
                 bridge, _ = graph.shortest_path(
                     last_edge_end,
                     first_edge_start,
                     blocked_edges=blocked_edges
                 )
+                if not bridge:
+                    # Thử không blocked
+                    bridge, _ = graph.shortest_path(
+                        last_edge_end,
+                        first_edge_start,
+                        blocked_edges=[]
+                    )
                 if bridge:
                     route_edges.extend(bridge)
 
