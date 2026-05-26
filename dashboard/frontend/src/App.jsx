@@ -301,6 +301,44 @@ function App() {
     return map;
   }, []);
 
+  /**
+   * Tính edge index real-time: tìm edge gần nhất xe đang ở trong route.
+   * Trả về số edges CÒN LẠI và ETA remaining.
+   */
+  const getRemainingInfoFn = useCallback((vehicleId) => {
+    const r = routesByVehicle[vehicleId];
+    const v = vehicles[vehicleId];
+    if (!r || !r.path || r.path.length === 0 || !v) {
+      return { remainingEdges: r?.path?.length || 0, remainingEta: r?.time || 0, edgeIndex: 0 };
+    }
+    let bestDist = Infinity;
+    let edgeIndex = 0;
+    for (let i = 0; i < r.path.length; i++) {
+      const edge = edgeLookup[r.path[i]];
+      if (!edge) continue;
+      const midLat = (edge.start_node.lat + edge.end_node.lat) / 2;
+      const midLon = (edge.start_node.lon + edge.end_node.lon) / 2;
+      const d = Math.abs(v.lat - midLat) + Math.abs(v.lon - midLon);
+      if (d < bestDist) { bestDist = d; edgeIndex = i; }
+    }
+    const remainingPath = r.path.slice(edgeIndex);
+    const remainingEta = estimateEtaFromPath(remainingPath, edgeLookup);
+    return { remainingEdges: remainingPath.length, remainingEta, edgeIndex };
+  }, [routesByVehicle, vehicles, edgeLookup]);
+
+  // Cache kết quả cho tất cả xe có route — tránh tính lại mỗi render call
+  const remainingInfoCache = useMemo(() => {
+    const cache = {};
+    Object.keys(routesByVehicle).forEach((vid) => {
+      cache[vid] = getRemainingInfoFn(vid);
+    });
+    return cache;
+  }, [routesByVehicle, vehicles, getRemainingInfoFn]);
+
+  const getRemainingInfo = useCallback((vehicleId) => {
+    return remainingInfoCache[vehicleId] || { remainingEdges: 0, remainingEta: 0, edgeIndex: 0 };
+  }, [remainingInfoCache]);
+
   const mergeRoutes = useCallback((list) => {
     setRoutesByVehicle((prev) => {
       const next = { ...prev };
@@ -477,7 +515,7 @@ function App() {
                     }} />
                     <strong>{vid}</strong>
                     <div style={{ color: "#555", marginTop: 2, display: "block" }}>
-                      ETA: {formatEtaMinutes(r.time || estimateEtaFromPath(r.path, edgeLookup))} · {r.path.length} cạnh
+                      ETA: {formatEtaMinutes(getRemainingInfo(vid).remainingEta)} · {getRemainingInfo(vid).remainingEdges} cạnh
                     </div>
                   </button>
                 </li>
@@ -503,7 +541,7 @@ function App() {
           <div style={{ marginTop: 4 }}>
             <span style={{ color: selectedColor, fontWeight: 700 }}>━━</span> {selectedVehicleId}
             <br />
-            ETA: {selectedRoute ? formatEtaMinutes(selectedRoute.time || estimateEtaFromPath(selectedRoute.path, edgeLookup)) : "—"}
+            ETA: {selectedVehicleId ? formatEtaMinutes(getRemainingInfo(selectedVehicleId).remainingEta) : "—"} · {selectedVehicleId ? getRemainingInfo(selectedVehicleId).remainingEdges : 0} cạnh còn lại
           </div>
         ) : (
           <div style={{ color: "#666" }}>Chọn xe ở panel trái hoặc bấm xe trên map.</div>
@@ -591,7 +629,7 @@ function App() {
                   {idx === 0 && (
                     <Popup>
                       {selectedVehicleId}<br />
-                      ETA: {formatEtaMinutes(r.time || estimateEtaFromPath(r.path, edgeLookup))}
+                      ETA: {formatEtaMinutes(getRemainingInfo(selectedVehicleId).remainingEta)} · {getRemainingInfo(selectedVehicleId).remainingEdges} cạnh còn lại
                       {r.rerouted && r.reroute_reason && (
                         <><br /><span style={{ color: "#ef4444" }}>⚠️ {r.reroute_reason}</span></>
                       )}
