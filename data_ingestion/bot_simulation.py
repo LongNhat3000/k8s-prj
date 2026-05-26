@@ -101,9 +101,6 @@ def reload_routes_for_trucks(trucks_list):
     load_routes_from_mongo()
     new_count = len(mongo_routes)
     
-    if new_count <= old_count:
-        return
-    
     # Cập nhật route mới cho trucks đang dùng fallback hoặc route cũ
     updated = 0
     for truck in trucks_list:
@@ -115,8 +112,16 @@ def reload_routes_for_trucks(trucks_list):
                 # Chỉ update nếu route khác route hiện tại
                 old_ids = [e['edge_id'] for e in (truck._route_edges or [])]
                 if [e['edge_id'] for e in new_route] != old_ids:
+                    # Tìm vị trí hiện tại của xe trong route MỚI
+                    # để không bị teleport về đầu
+                    current_edge_id = truck.current_edge['edge_id']
+                    new_index = 0
+                    for i, edge in enumerate(new_route):
+                        if edge['edge_id'] == current_edge_id:
+                            new_index = i
+                            break
                     truck._route_edges = new_route
-                    truck._route_index = 0
+                    truck._route_index = new_index
                     updated += 1
     
     if updated > 0:
@@ -413,10 +418,8 @@ class Vehicle:
         self._route_index += 1
         
         if self._route_index >= len(self._route_edges):
-            # Hoàn thành toàn bộ route → quay lại từ đầu (loop)
-            self._route_index = 0
-            first_edge = self._route_edges[0]
-            self._enter_edge(first_edge)
+            # Hoàn thành route → tạo 10 customers mới và tính route tiếp
+            self._generate_new_delivery_cycle()
             return
         
         next_edge = self._route_edges[self._route_index]
@@ -438,7 +441,9 @@ class Vehicle:
                 self.stuck_count = 0
                 self._route_index += 1
                 if self._route_index >= len(self._route_edges):
-                    self._route_index = 0
+                    # Hết route → tạo delivery cycle mới thay vì teleport
+                    self._generate_new_delivery_cycle()
+                    return
                 next_edge = self._route_edges[self._route_index]
                 self._enter_edge(next_edge)
         else:
@@ -486,6 +491,117 @@ class Vehicle:
         else:
             self._enter_edge(best_edge)
             self.stuck_count = 0
+
+    def _generate_new_delivery_cycle(self):
+        """
+        Khi xe đi hết route → tạo 10 customers mới ngẫu nhiên gần vị trí hiện tại,
+        tính Dijkstra route qua các customers đó, ghi lên MongoDB để dashboard hiển thị.
+        Xe tiếp tục đi LIÊN TỤC từ vị trí cuối route (không teleport).
+        """
+        vid = self.entity_id
+        current_node = self.current_edge['end_node']['node_id']
+        
+        # 1. Chọn 10 edges ngẫu nhiên làm điểm giao hàng (customers)
+        #    Ưu tiên edges gần vị trí hiện tại (trong bán kính ~2km)
+        cur_lat = self.latitude
+        cur_lon = self.longitude
+        RADIUS = 0.02  # ~2km
+        
+        nearby_edges = [
+            e for e in self.all_edges
+            if abs(e['start_node']['lat'] - cur_lat) < RADIUS
+            and abs(e['start_node']['lon'] - cur_lon) < RADIUS
+        ]
+        
+        if len(nearby_edges) < 10:
+            nearby_edges = self.all_edges  # fallback toàn bộ
+        
+        customer_edges = random.sample(nearby_edges, min(10, len(nearby_edges)))
+        
+        # 2. Tạo danh sách customers mới
+        new_customers = []
+        for i, edge in enumerate(customer_edges):
+            new_customers.append({
+                "cust_id": f"{vid}_cycle_{int(time.time())}_{i:02d}",
+                "latitude": edge['start_node']['lat'],
+                "longitude": edge['start_node']['lon'],
+                "order": i + 1,
+                "status": "next" if i == 0 else "pending",
+            })
+        
+        # 3. Tính Dijkstra route qua các customers (nearest-neighbor greedy)
+        full_route = []
+        cur_node = current_node
+        unvisited = list(range(len(customer_edges)))
+        
+        while unvisited:
+            # Tìm customer gần nhất
+            best_idx = unvisited[0]
+            best_dist = float('inf')
+            cur_adj = graph_adj.get(cur_node, [])
+            if cur_adj:
+                c_lat = cur_adj[0]['start_node']['lat']
+                c_lon = cur_adj[0]['start_node']['lon']
+            else:
+                c_lat, c_lon = cur_lat, cur_lon
+            
+            for i in unvisited:
+                ce = customer_edges[i]
+                d = (ce['start_node']['lat'] - c_lat) ** 2 + (ce['start_node']['lon'] - c_lon) ** 2
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+            
+            unvisited.remove(best_idx)
+            target_node = customer_edges[best_idx]['start_node']['node_id']
+            
+            segment = dijkstra(cur_node, target_node)
+            if segment:
+                full_route.extend(segment)
+                cur_node = target_node
+        
+        # 4. Cập nhật xe — LIÊN TỤC từ vị trí hiện tại
+        if full_route:
+            self._route_edges = full_route
+            self._route_index = 0
+            first_edge = self._route_edges[0]
+            self._enter_edge(first_edge)
+            
+            # 5. Ghi route mới + customers lên MongoDB → Change Stream push tới dashboard
+            mongo_customers[vid] = new_customers
+            route_ids = [e['edge_id'] for e in full_route]
+            self._save_new_route_to_mongo(vid, route_ids, new_customers)
+            
+            print(f"🔄 {vid}: Hoàn thành route → tạo 10 customers mới, route {len(full_route)} edges.")
+        else:
+            # Fallback: không tìm được route → dùng greedy
+            self._route_edges = None
+            self.target_edge = random.choice(self.all_edges)
+
+    def _save_new_route_to_mongo(self, vehicle_id, route_edge_ids, customers):
+        """Ghi route mới lên MongoDB (async-safe, best effort)."""
+        mongo_uri = os.getenv("MONGO_URI", "mongodb://mongodb:27017/")
+        try:
+            from pymongo import MongoClient
+            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+            coll = client["traffic_system"]["assigned_routes"]
+            coll.update_one(
+                {"vehicle_id": vehicle_id},
+                {"$set": {
+                    "new_assigned_route": route_edge_ids,
+                    "assigned_route": route_edge_ids,
+                    "customers": customers,
+                    "remaining_customers": customers,
+                    "current_edge_index": 0,
+                    "total_edges": len(route_edge_ids),
+                    "rerouted": False,
+                    "estimated_total_travel_time": len(route_edge_ids) * 5,
+                }},
+                upsert=True,
+            )
+            client.close()
+        except Exception:
+            pass  # Best effort — không block main loop
 
     def _enter_edge(self, edge):
         """Chuyển xe sang edge mới."""

@@ -210,12 +210,33 @@ function CanvasTrafficLayer({ trafficRef }) {
 
 // =========================================================================
 
-function MapFlyTo({ lat, lon, zoom = 16 }) {
+function MapFlyTo({ lat, lon, zoom = 16, follow, onFlyDone }) {
+  const map = useMap();
+
+  // Chỉ flyTo khi follow === true (user vừa click chọn xe)
+  useEffect(() => {
+    if (!follow || lat == null || lon == null) return;
+    map.flyTo([lat, lon], zoom, { duration: 0.6 });
+    // Sau khi flyTo xong → tắt follow để xe update tiếp không kéo lại
+    if (onFlyDone) onFlyDone();
+  }, [map, lat, lon, zoom, follow]);
+
+  return null;
+}
+
+/**
+ * Detect khi user tự pan/zoom bản đồ → tắt follow mode.
+ */
+function MapDragDetector({ onUserPanRef }) {
   const map = useMap();
   useEffect(() => {
-    if (lat == null || lon == null) return;
-    map.flyTo([lat, lon], zoom, { duration: 0.6 });
-  }, [map, lat, lon, zoom]);
+    const handler = () => {
+      if (onUserPanRef.current) onUserPanRef.current();
+    };
+    map.on("dragstart", handler);
+    return () => { map.off("dragstart", handler); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map]);
   return null;
 }
 
@@ -268,7 +289,11 @@ function App() {
   const [routesByVehicle, setRoutesByVehicle] = useState({});
   const [selectedVehicleId, setSelectedVehicleId] = useState(null);
   const [routeFilter, setRouteFilter] = useState("");
+  const [followVehicle, setFollowVehicle] = useState(false);
   const socketRef = useRef(null);
+
+  const onUserPanRef = useRef(() => setFollowVehicle(false));
+  onUserPanRef.current = () => setFollowVehicle(false);
 
   const edgeLookup = useMemo(() => {
     const map = {};
@@ -371,6 +396,8 @@ function App() {
     (vid) => {
       setSelectedVehicleId((prev) => {
         const newSelected = prev === vid ? null : vid;
+        // Bật follow khi chọn xe mới, tắt khi bỏ chọn
+        setFollowVehicle(newSelected !== null);
         // Chỉ request route on-demand nếu xe CHƯA CÓ route từ MongoDB (GA)
         // Nếu đã có route GA → giữ nguyên (vì bot đi theo route GA)
         if (newSelected && socketRef.current && !routesByVehicle[newSelected]?.path?.length) {
@@ -487,7 +514,10 @@ function App() {
       <MapContainer center={[21.0262, 105.8375]} zoom={15} style={{ height: "100%", width: "100%" }} preferCanvas>
         <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
 
-        {selectedVehicle && <MapFlyTo lat={selectedVehicle.lat} lon={selectedVehicle.lon} />}
+        {selectedVehicle && <MapFlyTo lat={selectedVehicle.lat} lon={selectedVehicle.lon} follow={followVehicle} onFlyDone={() => setFollowVehicle(false)} />}
+
+        {/* Detect user pan → tắt auto-center */}
+        <MapDragDetector onUserPanRef={onUserPanRef} />
 
         {/* Traffic layer: Canvas trực tiếp — KHÔNG qua React DOM */}
         <CanvasTrafficLayer trafficRef={trafficRef} />
@@ -497,12 +527,27 @@ function App() {
           const r = routesByVehicle[selectedVehicleId];
           const color = hashHue(selectedVehicleId);
 
-          const edgeIndex = r.current_edge_index || 0;
+          // Tính edge index real-time: tìm edge gần nhất với vị trí xe hiện tại
+          const vehicle = vehicles[selectedVehicleId];
+          let edgeIndex = r.current_edge_index || 0;
+          if (vehicle && r.path.length > 0) {
+            let bestDist = Infinity;
+            for (let i = 0; i < r.path.length; i++) {
+              const edge = edgeLookup[r.path[i]];
+              if (!edge) continue;
+              const midLat = (edge.start_node.lat + edge.end_node.lat) / 2;
+              const midLon = (edge.start_node.lon + edge.end_node.lon) / 2;
+              const d = Math.abs(vehicle.lat - midLat) + Math.abs(vehicle.lon - midLon);
+              if (d < bestDist) {
+                bestDist = d;
+                edgeIndex = i;
+              }
+            }
+          }
           const passedPath = r.path.slice(0, edgeIndex);
           const remainingPath = r.path.slice(edgeIndex);
 
-          // Tính đường nối từ xe hiện tại → start route (nét đứt)
-          const vehicle = vehicles[selectedVehicleId];
+          // Tính đường nối từ xe hiện tại → start đoạn còn lại
           const firstEdgeOfRemaining = edgeLookup[remainingPath[0]];
           let connectorLine = null;
           if (vehicle && firstEdgeOfRemaining) {
@@ -525,7 +570,7 @@ function App() {
                 <Polyline
                   key="connector-vehicle-to-route"
                   positions={connectorLine}
-                  pathOptions={{ color, weight: 4, opacity: 0.7, dashArray: "10 8" }}
+                  pathOptions={{ color, weight: 3, opacity: 0.35 }}
                 />
               )}
               {/* Đoạn đã đi — mờ */}
@@ -533,7 +578,7 @@ function App() {
                 <Polyline
                   key={`passed-${idx}`}
                   positions={seg}
-                  pathOptions={{ color: "#9ca3af", weight: 4, opacity: 0.4, dashArray: "8 6" }}
+                  pathOptions={{ color: "#9ca3af", weight: 4, opacity: 0.25 }}
                 />
               ))}
               {/* Đoạn chưa đi — đậm */}
