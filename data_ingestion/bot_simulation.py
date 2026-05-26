@@ -19,6 +19,9 @@ graph_adj = {}        # node_id → [edge, ...]
 
 # --- MONGODB ROUTES (cho Truck) ---
 mongo_routes = {}     # vehicle_id → list of edge_ids từ MongoDB
+mongo_customers = {}  # vehicle_id → list of customers (với status)
+_delivery_queue = []  # [(vehicle_id, cust_id)] — queue cập nhật MongoDB
+_last_delivery_flush = 0
 _last_route_reload = 0  # timestamp lần cuối reload routes
 
 
@@ -70,6 +73,10 @@ def load_routes_from_mongo():
                 if len(valid_route) >= 2:
                     mongo_routes[vid] = valid_route
                     count += 1
+            # Load customers cho delivery tracking
+            customers = doc.get("customers") or []
+            if customers:
+                mongo_customers[vid] = customers
         
         client.close()
         print(f"✅ Đã tải {count} routes từ MongoDB cho Trucks.")
@@ -114,6 +121,77 @@ def reload_routes_for_trucks(trucks_list):
     
     if updated > 0:
         print(f"🔄 Đã cập nhật route mới cho {updated} Trucks từ MongoDB (GA optimized).")
+
+
+def check_customer_delivery(truck):
+    """
+    Kiểm tra xe có đến gần customer nào không.
+    Nếu khoảng cách < 100m → đánh dấu delivered.
+    """
+    vid = truck.entity_id
+    customers = mongo_customers.get(vid, [])
+    if not customers:
+        return
+    
+    DELIVERY_RADIUS = 0.001  # ~111m (khoảng 0.001 độ ≈ 100m)
+    
+    for cust in customers:
+        if cust.get("status") == "delivered":
+            continue
+        
+        clat = cust.get("latitude", 0)
+        clon = cust.get("longitude", 0)
+        
+        dist = abs(truck.latitude - clat) + abs(truck.longitude - clon)
+        
+        if dist < DELIVERY_RADIUS:
+            cust["status"] = "delivered"
+            _delivery_queue.append((vid, cust.get("cust_id")))
+            # Cập nhật customer tiếp theo thành "next"
+            for next_cust in customers:
+                if next_cust.get("status") == "pending":
+                    next_cust["status"] = "next"
+                    break
+
+
+def flush_delivery_updates():
+    """
+    Ghi batch customer status updates lên MongoDB mỗi 5s.
+    Change Stream sẽ push tới frontend → marker đổi màu.
+    """
+    global _last_delivery_flush, _delivery_queue
+    
+    now = time.time()
+    if now - _last_delivery_flush < 5:
+        return
+    _last_delivery_flush = now
+    
+    if not _delivery_queue:
+        return
+    
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://mongodb:27017/")
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        coll = client["traffic_system"]["assigned_routes"]
+        
+        # Group by vehicle_id
+        vehicles_to_update = set(vid for vid, _ in _delivery_queue)
+        for vid in vehicles_to_update:
+            customers = mongo_customers.get(vid, [])
+            if customers:
+                coll.update_one(
+                    {"vehicle_id": vid},
+                    {"$set": {"customers": customers}}
+                )
+        
+        delivered_count = len(_delivery_queue)
+        _delivery_queue = []
+        client.close()
+        if delivered_count > 0:
+            print(f"📦 Đã giao hàng cho {delivered_count} customers (đổi màu trên dashboard).")
+    except Exception as e:
+        pass  # Best effort — không block main loop
 
 
 # ============================================================
@@ -471,6 +549,12 @@ if __name__ == "__main__":
             for v in vehicles:
                 v.move()
                 producer.produce_message(v.to_json_message())
+            
+            # Check delivery: xe đến gần customer → đánh dấu delivered
+            for truck in trucks:
+                check_customer_delivery(truck)
+            # Flush delivery updates lên MongoDB mỗi 5s
+            flush_delivery_updates()
             
             producer.flush()
             

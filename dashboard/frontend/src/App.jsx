@@ -329,9 +329,11 @@ function App() {
     socket.on("route_optimized", (data) => { mergeRoutes([data]); });
     socket.on("route_result", (data) => {
       if (!data || !data.vehicle_id || !data.path || data.path.length === 0) return;
-      // route_result (on-demand PathFinder) — LUÔN ghi đè route cũ
-      // Vì user chủ động request route mới từ vị trí xe hiện tại
+      // route_result (on-demand PathFinder) — chỉ dùng khi xe chưa có route GA
+      // Vì bot đi theo route GA từ MongoDB, frontend phải hiện cùng route đó
       setRoutesByVehicle((prev) => {
+        // Nếu đã có route (từ snapshot/GA) → KHÔNG ghi đè
+        if (prev[data.vehicle_id]?.path?.length > 0) return prev;
         const next = { ...prev };
         next[data.vehicle_id] = { path: data.path, time: data.time, customers: data.customers || [], current_edge_index: data.current_edge_index || 0, total_edges: data.total_edges || data.path.length, rerouted: false, reroute_reason: "" };
         return next;
@@ -369,8 +371,9 @@ function App() {
     (vid) => {
       setSelectedVehicleId((prev) => {
         const newSelected = prev === vid ? null : vid;
-        // LUÔN request route mới từ vị trí xe hiện tại khi chọn xe
-        if (newSelected && socketRef.current) {
+        // Chỉ request route on-demand nếu xe CHƯA CÓ route từ MongoDB (GA)
+        // Nếu đã có route GA → giữ nguyên (vì bot đi theo route GA)
+        if (newSelected && socketRef.current && !routesByVehicle[newSelected]?.path?.length) {
           const v = vehicles[newSelected];
           if (v && v.lat && v.lon) {
             socketRef.current.emit("request_route", { vehicle_id: newSelected, lat: v.lat, lon: v.lon });
