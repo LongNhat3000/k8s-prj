@@ -138,7 +138,7 @@ def check_customer_delivery(truck):
     if not customers:
         return
     
-    DELIVERY_RADIUS = 0.001  # ~111m (khoảng 0.001 độ ≈ 100m)
+    DELIVERY_RADIUS = 0.0002  # ~22m (khoảng 0.0002 độ ≈ 20m)
     
     for cust in customers:
         if cust.get("status") == "delivered":
@@ -296,8 +296,8 @@ class Vehicle:
             self._init_bot_target()
 
     def _init_bot_target(self):
-        """Bot: chọn 1 đích ngẫu nhiên, 20% vào điểm nóng."""
-        if random.random() < 0.20:
+        """Bot: chọn 1 đích ngẫu nhiên, 30% vào điểm nóng."""
+        if random.random() < 0.30:
             self.target_edge = random.choice(ATTRACTOR_EDGES)
         else:
             self.target_edge = random.choice(self.all_edges)
@@ -494,33 +494,68 @@ class Vehicle:
 
     def _generate_new_delivery_cycle(self):
         """
-        Khi xe đi hết route → tạo 10 customers mới ngẫu nhiên gần vị trí hiện tại,
-        tính Dijkstra route qua các customers đó, ghi lên MongoDB để dashboard hiển thị.
-        Xe tiếp tục đi LIÊN TỤC từ vị trí cuối route (không teleport).
+        Khi xe đi hết route → tạo 10 customers mới (BẮT BUỘC reachable),
+        tính Dijkstra route qua các customers đó, ghi lên MongoDB.
+        Fallback mở rộng bán kính nếu không đủ 10 customer gần.
         """
         vid = self.entity_id
         current_node = self.current_edge['end_node']['node_id']
-        
-        # 1. Chọn 10 edges ngẫu nhiên làm điểm giao hàng (customers)
-        #    Ưu tiên edges gần vị trí hiện tại (trong bán kính ~2km)
         cur_lat = self.latitude
         cur_lon = self.longitude
-        RADIUS = 0.02  # ~2km
-        
-        nearby_edges = [
-            e for e in self.all_edges
-            if abs(e['start_node']['lat'] - cur_lat) < RADIUS
-            and abs(e['start_node']['lon'] - cur_lon) < RADIUS
-        ]
-        
-        if len(nearby_edges) < 10:
-            nearby_edges = self.all_edges  # fallback toàn bộ
-        
-        customer_edges = random.sample(nearby_edges, min(10, len(nearby_edges)))
-        
-        # 2. Tạo danh sách customers mới
+
+        TARGET_CUSTOMERS = 10
+
+        # Mở rộng bán kính dần cho đến khi tìm đủ 10 customer reachable
+        reachable_customers = []  # [(edge, segment_path)]
+        test_node = current_node
+
+        for radius in [0.02, 0.04, 0.08, 0.15]:  # 2km → 4km → 8km → 15km
+            nearby_edges = [
+                e for e in self.all_edges
+                if abs(e['start_node']['lat'] - cur_lat) < radius
+                and abs(e['start_node']['lon'] - cur_lon) < radius
+                and e['start_node']['node_id'] != test_node
+            ]
+
+            if len(nearby_edges) < TARGET_CUSTOMERS:
+                continue  # Bán kính quá nhỏ, mở rộng tiếp
+
+            random.shuffle(nearby_edges)
+
+            # Reset nếu mở rộng bán kính (thử lại từ đầu)
+            reachable_customers = []
+            test_node = current_node
+
+            for edge in nearby_edges:
+                if len(reachable_customers) >= TARGET_CUSTOMERS:
+                    break
+
+                target_node = edge['start_node']['node_id']
+                if target_node == test_node:
+                    continue
+
+                # Chỉ chấp nhận customer mà Dijkstra tìm ĐƯỢC đường
+                segment = dijkstra(test_node, target_node)
+                if segment:
+                    reachable_customers.append((edge, segment))
+                    test_node = target_node
+
+            if len(reachable_customers) >= TARGET_CUSTOMERS:
+                break  # Đủ 10 → thoát
+
+        # Nếu vẫn không đủ → chấp nhận bao nhiêu có bấy nhiêu (tối thiểu 1)
+        if not reachable_customers:
+            # Hoàn toàn không tìm được → fallback greedy
+            self._route_edges = None
+            self.target_edge = random.choice(self.all_edges)
+            print(f"⚠️ {vid}: Không tìm được customer reachable nào → fallback greedy.")
+            return
+
+        # Xây route + customer list từ kết quả đã validate
+        full_route = []
         new_customers = []
-        for i, edge in enumerate(customer_edges):
+        for i, (edge, segment) in enumerate(reachable_customers):
+            full_route.extend(segment)
             new_customers.append({
                 "cust_id": f"{vid}_cycle_{int(time.time())}_{i:02d}",
                 "latitude": edge['start_node']['lat'],
@@ -528,55 +563,18 @@ class Vehicle:
                 "order": i + 1,
                 "status": "next" if i == 0 else "pending",
             })
-        
-        # 3. Tính Dijkstra route qua các customers (nearest-neighbor greedy)
-        full_route = []
-        cur_node = current_node
-        unvisited = list(range(len(customer_edges)))
-        
-        while unvisited:
-            # Tìm customer gần nhất
-            best_idx = unvisited[0]
-            best_dist = float('inf')
-            cur_adj = graph_adj.get(cur_node, [])
-            if cur_adj:
-                c_lat = cur_adj[0]['start_node']['lat']
-                c_lon = cur_adj[0]['start_node']['lon']
-            else:
-                c_lat, c_lon = cur_lat, cur_lon
-            
-            for i in unvisited:
-                ce = customer_edges[i]
-                d = (ce['start_node']['lat'] - c_lat) ** 2 + (ce['start_node']['lon'] - c_lon) ** 2
-                if d < best_dist:
-                    best_dist = d
-                    best_idx = i
-            
-            unvisited.remove(best_idx)
-            target_node = customer_edges[best_idx]['start_node']['node_id']
-            
-            segment = dijkstra(cur_node, target_node)
-            if segment:
-                full_route.extend(segment)
-                cur_node = target_node
-        
-        # 4. Cập nhật xe — LIÊN TỤC từ vị trí hiện tại
-        if full_route:
-            self._route_edges = full_route
-            self._route_index = 0
-            first_edge = self._route_edges[0]
-            self._enter_edge(first_edge)
-            
-            # 5. Ghi route mới + customers lên MongoDB → Change Stream push tới dashboard
-            mongo_customers[vid] = new_customers
-            route_ids = [e['edge_id'] for e in full_route]
-            self._save_new_route_to_mongo(vid, route_ids, new_customers)
-            
-            print(f"🔄 {vid}: Hoàn thành route → tạo 10 customers mới, route {len(full_route)} edges.")
-        else:
-            # Fallback: không tìm được route → dùng greedy
-            self._route_edges = None
-            self.target_edge = random.choice(self.all_edges)
+
+        # Cập nhật xe — LIÊN TỤC từ vị trí hiện tại
+        self._route_edges = full_route
+        self._route_index = 0
+        self._enter_edge(self._route_edges[0])
+
+        # Ghi route mới + customers lên MongoDB → Change Stream → dashboard
+        mongo_customers[vid] = new_customers
+        route_ids = [e['edge_id'] for e in full_route]
+        self._save_new_route_to_mongo(vid, route_ids, new_customers)
+
+        print(f"🔄 {vid}: Tạo {len(new_customers)} customers (reachable), route {len(full_route)} edges.")
 
     def _save_new_route_to_mongo(self, vehicle_id, route_edge_ids, customers):
         """Ghi route mới lên MongoDB (async-safe, best effort)."""
@@ -639,7 +637,7 @@ if __name__ == "__main__":
     
     producer = GPSProducer()
     
-    NUM_BOTS = int(os.getenv("NUM_BOTS", "3000"))
+    NUM_BOTS = int(os.getenv("NUM_BOTS", "5000"))
     TICK_INTERVAL = float(os.getenv("TICK_INTERVAL", "2.0"))
     
     print(f"Đang khởi tạo {NUM_BOTS} Bots và 100 Trucks (interval={TICK_INTERVAL}s)...")

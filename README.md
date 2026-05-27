@@ -2,7 +2,7 @@
 
 ## Mô tả
 
-Hệ thống mô phỏng và tối ưu tuyến đường giao hàng real-time cho **100 xe tải × 10 khách hàng** trên bản đồ Hà Nội. Xử lý ~10.000 GPS messages/giây, phát hiện tắc nghẽn, và tự động tái tối ưu tuyến đường bằng Genetic Algorithm + Dijkstra.
+Hệ thống mô phỏng và tối ưu tuyến đường giao hàng real-time cho **100 xe tải × 10 khách hàng** trên bản đồ Hà Nội. Xử lý ~5.000 GPS messages/giây, phát hiện tắc nghẽn, và tự động tái tối ưu tuyến đường bằng Genetic Algorithm + Dijkstra.
 
 ---
 
@@ -11,7 +11,7 @@ Hệ thống mô phỏng và tối ưu tuyến đường giao hàng real-time ch
 ```
 ┌────────────────┐         ┌─────────┐         ┌──────────────────┐         ┌───────┐
 │  Bot Simulation│────────▶│  KAFKA  │────────▶│ Stream Processing│────────▶│ REDIS │
-│  (10k xe/GPS)  │  topic: │         │         │ (PySpark)        │  edge:* │       │
+│  (5k xe/GPS)  │  topic: │         │         │ (PySpark)        │  edge:* │       │
 └────────────────┘ gps_stream└────┬────┘         └──────────────────┘         └───┬───┘
                                   │                                                │
                                   ▼                                                ▼
@@ -36,7 +36,7 @@ Hệ thống mô phỏng và tối ưu tuyến đường giao hàng real-time ch
 
 | Module             | Công nghệ                        | Vai trò                                         |
 | ------------------ | -------------------------------- | ----------------------------------------------- |
-| Data Ingestion     | Python, confluent-kafka          | Mô phỏng 10k xe, gửi GPS → Kafka                |
+| Data Ingestion     | Python, confluent-kafka          | Mô phỏng 5k xe, gửi GPS → Kafka                 |
 | Stream Processing  | PySpark Structured Streaming     | Map-matching GPS → edge, tính avg_speed → Redis |
 | Route Optimization | Python, GA + Dijkstra            | Tối ưu thứ tự 10 khách/xe, tính shortest-path   |
 | Backend            | Node.js, Socket.IO, KafkaJS      | Trung gian: Kafka + Redis + MongoDB → Frontend  |
