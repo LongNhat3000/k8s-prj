@@ -196,6 +196,8 @@ kubectl logs deployment/route-optimization --tail=20
 
 kubectl exec -it deployment/redis -- redis-cli KEYS "edge:\*" | Select-Object -First 10
 
+kubectl exec -it deployment/kafka -- kafka-console-consumer --bootstrap-server kafka:9092 --topic gps_stream --timeout-ms 10000 --max-messages 5
+
 → Mở **http://localhost:5173**
 
 #### Rebuild khi sửa code
