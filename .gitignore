@@ -5,3 +5,6 @@ __pycache__
 spark_checkpoints
 
 package-lock.json
+
+# Báo cáo và tài liệu
+Docs/
