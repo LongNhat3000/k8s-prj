@@ -1,0 +1,7 @@
+{
+  "name": "convert-tmp",
+  "version": "1.0.0",
+  "dependencies": {
+    "marked": "^12.0.0"
+  }
+}

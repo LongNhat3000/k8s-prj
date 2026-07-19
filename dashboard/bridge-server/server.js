@@ -109,7 +109,20 @@ async function runKafkaForever() {
         const bulkOps = updates.map(([vehicle_id, edge_id]) => ({
           updateOne: {
             filter: { vehicle_id },
-            update: { $set: { current_edge_id: edge_id, edge_id: edge_id } },
+            update: {
+              $set: { current_edge_id: edge_id, edge_id: edge_id },
+              $setOnInsert: {
+                new_assigned_route: [],
+                assigned_route: [],
+                customers: [],
+                remaining_customers: [],
+                current_edge_index: 0,
+                total_edges: 0,
+                estimated_total_travel_time: 0,
+                needs_optimization: false
+              }
+            },
+            upsert: true
           }
         }));
         
@@ -166,6 +179,12 @@ const RouteModel = mongoose.model("Route", new mongoose.Schema({
   rerouted: Boolean,
   reroute_reason: String,
   estimated_total_travel_time: Number,
+  needs_optimization: Boolean,
+  current_edge_id: String,
+  edge_id: String,
+  optimized_customer_order: [String],
+  last_optimized_at: Number,
+  route_status: String,
 }), "assigned_routes");
 
 function setupChangeStreams() {
@@ -225,6 +244,87 @@ io.on("connection", (socket) => {
   console.log("📡 Dashboard connected: " + socket.id);
 
   emitRoutesSnapshot(socket);
+
+  // --- CREATE ORDER DIRECTLY FROM DASHBOARD ---
+  socket.on("create_order", async (data) => {
+    try {
+      const { vehicle_id, lat, lon } = data || {};
+      if (!vehicle_id || lat == null || lon == null) {
+        console.warn("⚠️ create_order: Thiếu thông tin", data);
+        return;
+      }
+      if (!mongoReady) {
+        console.warn("⚠️ create_order: MongoDB chưa sẵn sàng");
+        return;
+      }
+
+      let doc = await RouteModel.findOne({ vehicle_id });
+      let customers = [];
+      let remaining_customers = [];
+      if (doc) {
+        customers = doc.customers || [];
+        remaining_customers = doc.remaining_customers || [];
+      }
+
+      const orderNum = customers.length + 1;
+      const newCustId = `Cust_${vehicle_id}_${Date.now()}`;
+      const newCust = {
+        cust_id: newCustId,
+        latitude: parseFloat(lat),
+        longitude: parseFloat(lon),
+        order: orderNum,
+        status: customers.length === 0 ? "next" : "pending"
+      };
+
+      customers.push(newCust);
+      remaining_customers.push(newCust);
+
+      await RouteModel.updateOne(
+        { vehicle_id },
+        {
+          $set: {
+            customers,
+            remaining_customers,
+            needs_optimization: true
+          }
+        },
+        { upsert: true }
+      );
+      console.log(`➕ Đã tạo đơn hàng mới cho ${vehicle_id}: ${newCustId} (${lat}, ${lon})`);
+    } catch (err) {
+      console.error("❌ Lỗi create_order:", err.message);
+    }
+  });
+
+  // --- CLEAR ORDERS ---
+  socket.on("clear_orders", async (data) => {
+    try {
+      const { vehicle_id } = data || {};
+      if (!vehicle_id) return;
+      if (!mongoReady) return;
+
+      await RouteModel.updateOne(
+        { vehicle_id },
+        {
+          $set: {
+            customers: [],
+            remaining_customers: [],
+            new_assigned_route: [],
+            assigned_route: [],
+            estimated_total_travel_time: 0,
+            current_edge_index: 0,
+            total_edges: 0,
+            rerouted: false,
+            reroute_reason: "Reset đơn hàng",
+            needs_optimization: false
+          }
+        }
+      );
+      console.log(`🧹 Đã xóa tất cả đơn hàng cho ${vehicle_id}`);
+    } catch (err) {
+      console.error("❌ Lỗi clear_orders:", err.message);
+    }
+  });
 
   // --- REQUEST ROUTE ON-DEMAND ---
   // Frontend gửi event khi user chọn xe → tính shortest path realtime

@@ -12,6 +12,7 @@ import {
   Popup,
   Marker,
   useMap,
+  useMapEvents,
 } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
@@ -144,8 +145,12 @@ function CanvasTrafficLayer({ trafficRef }) {
         this._canvas = L.DomUtil.create("canvas", "traffic-canvas-layer");
         this._canvas.style.position = "absolute";
         this._canvas.style.pointerEvents = "none";
-        this._canvas.style.zIndex = "200";
-        const pane = leafletMap.getPane("overlayPane");
+        
+        let pane = leafletMap.getPane("trafficPane");
+        if (!pane) {
+          pane = leafletMap.createPane("trafficPane");
+          pane.style.zIndex = "350";
+        }
         pane.appendChild(this._canvas);
         leafletMap.on("moveend zoomend resize", this._reset, this);
         this._reset();
@@ -171,6 +176,8 @@ function CanvasTrafficLayer({ trafficRef }) {
         if (!traffic) return;
 
         const bounds = this._map.getBounds();
+        const sw = bounds.getSouthWest();
+        const ne = bounds.getNorthEast();
         ctx.lineWidth = 3;
         ctx.lineCap = "round";
         ctx.globalAlpha = 0.85;
@@ -181,23 +188,23 @@ function CanvasTrafficLayer({ trafficRef }) {
 
           // Cull: bỏ edges ngoài viewport
           if (
-            coords.startLat < bounds._southWest.lat - 0.01 &&
-            coords.endLat < bounds._southWest.lat - 0.01
+            coords.startLat < sw.lat - 0.01 &&
+            coords.endLat < sw.lat - 0.01
           )
             continue;
           if (
-            coords.startLat > bounds._northEast.lat + 0.01 &&
-            coords.endLat > bounds._northEast.lat + 0.01
+            coords.startLat > ne.lat + 0.01 &&
+            coords.endLat > ne.lat + 0.01
           )
             continue;
           if (
-            coords.startLon < bounds._southWest.lng - 0.01 &&
-            coords.endLon < bounds._southWest.lng - 0.01
+            coords.startLon < sw.lng - 0.01 &&
+            coords.endLon < sw.lng - 0.01
           )
             continue;
           if (
-            coords.startLon > bounds._northEast.lng + 0.01 &&
-            coords.endLon > bounds._northEast.lng + 0.01
+            coords.startLon > ne.lng + 0.01 &&
+            coords.endLon > ne.lng + 0.01
           )
             continue;
 
@@ -247,6 +254,22 @@ function CanvasTrafficLayer({ trafficRef }) {
 }
 
 // =========================================================================
+
+function MapClickHandler({ onMapClick }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!map) return;
+    const handler = (e) => {
+      console.log("MapClickHandler: Map clicked at", e.latlng);
+      onMapClick(e.latlng);
+    };
+    map.on("click", handler);
+    return () => {
+      map.off("click", handler);
+    };
+  }, [map, onMapClick]);
+  return null;
+}
 
 function MapFlyTo({ lat, lon, zoom = 16, follow, onFlyDone }) {
   const map = useMap();
@@ -504,12 +527,13 @@ function App() {
   }, [mergeRoutes]);
 
   const routeEntries = useMemo(() => {
-    const entries = Object.entries(routesByVehicle).filter(
-      ([, r]) => r.path?.length,
-    );
+    const entries = Object.keys(vehicles).map((vid) => {
+      const r = routesByVehicle[vid] || { path: [], customers: [] };
+      return [vid, r];
+    });
     entries.sort(([a], [b]) => compareTruckIds(a, b));
     return entries;
-  }, [routesByVehicle]);
+  }, [vehicles, routesByVehicle]);
 
   const filteredRouteEntries = useMemo(() => {
     const q = routeFilter.trim().toLowerCase();
@@ -558,6 +582,66 @@ function App() {
     [vehicles, routesByVehicle],
   );
 
+  const addOrderOptimistic = useCallback((latlng) => {
+    console.log("addOrderOptimistic: called with", latlng, "for vehicle", selectedVehicleId);
+    if (!selectedVehicleId) return;
+    const newCustId = `Cust_${selectedVehicleId}_${Date.now()}`;
+    const newCust = {
+      cust_id: newCustId,
+      latitude: latlng.lat,
+      longitude: latlng.lng,
+      order: (routesByVehicle[selectedVehicleId]?.customers?.length || 0) + 1,
+      status: "pending",
+      isOptimistic: true
+    };
+
+    setRoutesByVehicle((prev) => {
+      const current = prev[selectedVehicleId] || { path: [], customers: [] };
+      return {
+        ...prev,
+        [selectedVehicleId]: {
+          ...current,
+          customers: [...(current.customers || []), newCust],
+        }
+      };
+    });
+
+    if (socketRef.current) {
+      socketRef.current.emit("create_order", {
+        vehicle_id: selectedVehicleId,
+        lat: latlng.lat,
+        lon: latlng.lng,
+      });
+    }
+  }, [selectedVehicleId, routesByVehicle]);
+
+  const addRandomOrder = useCallback(() => {
+    console.log("addRandomOrder: called for vehicle", selectedVehicleId);
+    if (!selectedVehicleId) return;
+    const randomEdge = edgesData[Math.floor(Math.random() * edgesData.length)];
+    if (randomEdge && randomEdge.start_node) {
+      addOrderOptimistic({
+        lat: randomEdge.start_node.lat,
+        lng: randomEdge.start_node.lon
+      });
+    }
+  }, [selectedVehicleId, addOrderOptimistic]);
+
+  const clearOrders = useCallback(() => {
+    if (!selectedVehicleId) return;
+    setRoutesByVehicle((prev) => {
+      const next = { ...prev };
+      delete next[selectedVehicleId];
+      return next;
+    });
+
+    if (socketRef.current) {
+      socketRef.current.emit("clear_orders", {
+        vehicle_id: selectedVehicleId
+      });
+    }
+  }, [selectedVehicleId]);
+
   return (
     <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
       {/* === SIDEBAR PANEL === */}
@@ -597,7 +681,7 @@ function App() {
         </p>
 
         <div style={{ fontWeight: 600, marginBottom: 6, color: "#333" }}>
-          Tối ưu theo xe ({routeEntries.length})
+          Danh sách xe tải ({routeEntries.length})
         </div>
         <input
           type="search"
@@ -654,6 +738,19 @@ function App() {
                       }}
                     />
                     <strong>{vid}</strong>
+                    <span
+                      style={{
+                        float: "right",
+                        fontSize: 10,
+                        padding: "1px 4px",
+                        borderRadius: 4,
+                        background: getRemainingInfo(vid).remainingKm > 0 ? "#dcfce7" : "#f1f5f9",
+                        color: getRemainingInfo(vid).remainingKm > 0 ? "#15803d" : "#475569",
+                        fontWeight: 600
+                      }}
+                    >
+                      {getRemainingInfo(vid).remainingKm > 0 ? "Đang chạy" : "Đang dừng"}
+                    </span>
                     <div
                       style={{ color: "#555", marginTop: 2, display: "block" }}
                     >
@@ -726,6 +823,165 @@ function App() {
         )}
       </div>
 
+      {/* === SELECTED VEHICLE & ORDER PANEL === */}
+      <div
+        className="dash-panel"
+        style={{
+          position: "absolute",
+          bottom: 12,
+          left: 12,
+          zIndex: 1000,
+          width: 280,
+          maxHeight: "38vh",
+          overflow: "auto",
+          padding: "12px 14px",
+          borderRadius: 10,
+          background: "rgba(255,255,255,0.94)",
+          boxShadow: "0 4px 20px rgba(0,0,0,0.12)",
+          fontSize: 13,
+          border: selectedVehicleId ? `1px solid ${selectedColor}` : "none",
+          transition: "border-color 0.3s ease",
+        }}
+      >
+        {selectedVehicleId ? (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <span style={{ fontWeight: 700, color: "#111", fontSize: 14 }}>
+                Quản lý đơn hàng: <span style={{ color: selectedColor }}>{selectedVehicleId}</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => selectVehicle(selectedVehicleId)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  cursor: "pointer",
+                  fontSize: 14,
+                  padding: 2,
+                  color: "#999",
+                }}
+                title="Bỏ chọn xe"
+              >
+                ✖
+              </button>
+            </div>
+            
+            <div style={{ background: "#f8fafc", padding: "6px 8px", borderRadius: 6, marginBottom: 8, fontSize: 11 }}>
+              <div>Trạng thái: <strong>{selectedVehicle?.speed > 0 ? "Đang di chuyển" : "Đang dừng đỗ"}</strong></div>
+              <div>Vị trí: <strong>{selectedVehicle?.edge_id || "Chưa xác định"}</strong></div>
+              <div>Tốc độ: <strong>{selectedVehicle?.speed || 0} km/h</strong></div>
+            </div>
+
+            <div style={{ fontWeight: 600, marginBottom: 4, color: "#333" }}>
+              Danh sách điểm giao ({selectedRoute?.customers?.length || 0})
+            </div>
+            
+            {(!selectedRoute?.customers || selectedRoute.customers.length === 0) ? (
+              <div style={{ color: "#666", fontSize: 11, fontStyle: "italic", marginBottom: 8 }}>
+                Chưa có đơn hàng nào. Hãy click vào bản đồ để thêm điểm giao hoặc chọn tự động bên dưới.
+              </div>
+            ) : (
+              <div style={{ maxHeight: "15vh", overflowY: "auto", marginBottom: 8, border: "1px solid #f1f5f9", borderRadius: 6 }}>
+                <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+                  {selectedRoute.customers.map((cust) => {
+                    const isNext = cust.status === "next";
+                    const isDelivered = cust.status === "delivered";
+                    const isOptimistic = cust.isOptimistic;
+                    return (
+                      <li
+                        key={cust.cust_id}
+                        style={{
+                          padding: "6px 8px",
+                          borderBottom: "1px solid #f1f5f9",
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          fontSize: 11,
+                          background: isNext ? "rgba(16, 185, 129, 0.05)" : "none",
+                        }}
+                      >
+                        <div>
+                          <span style={{ fontWeight: 600, marginRight: 4 }}>#{cust.order}</span>
+                          <span style={{ color: "#777", fontFamily: "monospace" }}>
+                            {cust.cust_id.substring(cust.cust_id.length - 6)}
+                          </span>
+                        </div>
+                        <div>
+                          {isOptimistic ? (
+                            <span style={{ color: "#f59e0b", background: "#fef3c7", padding: "2px 6px", borderRadius: 10, fontWeight: 600 }}>
+                              ⏳ Chờ tối ưu
+                            </span>
+                          ) : isDelivered ? (
+                            <span style={{ color: "#10b981", background: "#ecfdf5", padding: "2px 6px", borderRadius: 10, fontWeight: 600 }}>
+                              ✅ Đã giao
+                            </span>
+                          ) : isNext ? (
+                            <span style={{ color: "#3b82f6", background: "#dbeafe", padding: "2px 6px", borderRadius: 10, fontWeight: 600 }}>
+                              📍 Đang giao
+                            </span>
+                          ) : (
+                            <span style={{ color: "#6b7280", background: "#f3f4f6", padding: "2px 6px", borderRadius: 10 }}>
+                              🔴 Chờ
+                            </span>
+                          )}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+              <button
+                type="button"
+                onClick={addRandomOrder}
+                style={{
+                  flex: 1,
+                  padding: "6px 8px",
+                  borderRadius: 6,
+                  border: "none",
+                  background: "#10b981",
+                  color: "#fff",
+                  fontWeight: 600,
+                  fontSize: 11,
+                  cursor: "pointer",
+                }}
+              >
+                ➕ Thêm đơn
+              </button>
+              <button
+                type="button"
+                onClick={clearOrders}
+                style={{
+                  flex: 1,
+                  padding: "6px 8px",
+                  borderRadius: 6,
+                  border: "none",
+                  background: "#ef4444",
+                  color: "#fff",
+                  fontWeight: 600,
+                  fontSize: 11,
+                  cursor: "pointer",
+                }}
+              >
+                🧹 Xóa hết đơn
+              </button>
+            </div>
+            <div style={{ fontSize: 10, color: "#6b7280", marginTop: 8, textAlign: "center", fontStyle: "italic" }}>
+              💡 Bấm trực tiếp lên bản đồ để thêm điểm giao hàng nhanh.
+            </div>
+          </div>
+        ) : (
+          <div style={{ textAlign: "center", color: "#666", padding: "10px 0" }}>
+            <strong>💡 Chưa chọn xe tải</strong>
+            <p style={{ margin: "6px 0 0", fontSize: 11, lineHeight: 1.4 }}>
+              Chọn một xe trên danh sách hoặc bấm trực tiếp vào icon 🚚 trên bản đồ để bắt đầu giao hàng trực tiếp.
+            </p>
+          </div>
+        )}
+      </div>
+
       {/* === MAP === */}
       <MapContainer
         center={[21.0262, 105.8375]}
@@ -734,6 +990,14 @@ function App() {
         preferCanvas
       >
         <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+
+        {selectedVehicleId && (
+          <MapClickHandler
+            onMapClick={(latlng) => {
+              addOrderOptimistic(latlng);
+            }}
+          />
+        )}
 
         {selectedVehicle && (
           <MapFlyTo
@@ -753,6 +1017,7 @@ function App() {
         {/* Route layer: 2 màu — đã đi (mờ) + chưa đi (đậm) */}
         {selectedVehicleId &&
           routesByVehicle[selectedVehicleId] &&
+          routesByVehicle[selectedVehicleId].path &&
           (() => {
             const r = routesByVehicle[selectedVehicleId];
             const color = hashHue(selectedVehicleId);
@@ -860,7 +1125,10 @@ function App() {
               const status = cust.status || "pending";
               let emoji = "🔴";
               let size = 28;
-              if (status === "next") {
+              if (cust.isOptimistic) {
+                emoji = "⏳";
+                size = 28;
+              } else if (status === "next") {
                 emoji = "📍";
                 size = 36;
               } else if (status === "delivered") {
@@ -869,10 +1137,10 @@ function App() {
               }
 
               const icon = L.divIcon({
-                className: `customer-marker customer-${status}`,
+                className: `customer-marker customer-${cust.isOptimistic ? "optimistic" : status}`,
                 html:
                   `<div style="font-size:${size}px;text-align:center;line-height:1">${emoji}</div>` +
-                  `<div style="font-size:10px;text-align:center;color:#333;font-weight:600;margin-top:2px">${cust.order || ""}</div>`,
+                  `<div style="font-size:10px;text-align:center;color:#333;font-weight:600;margin-top:2px">${cust.isOptimistic ? "Chờ" : (cust.order || "")}</div>`,
                 iconSize: [40, 48],
                 iconAnchor: [20, 44],
               });
@@ -889,11 +1157,13 @@ function App() {
                     Thứ tự: {cust.order}
                     <br />
                     Trạng thái:{" "}
-                    {status === "delivered"
-                      ? "Đã giao"
-                      : status === "next"
-                        ? "Đang tới"
-                        : "Chờ giao"}
+                    {cust.isOptimistic
+                      ? "Đang gửi lên hệ thống để tối ưu lộ trình..."
+                      : status === "delivered"
+                        ? "Đã giao"
+                        : status === "next"
+                          ? "Đang tới"
+                          : "Chờ giao"}
                   </Popup>
                 </Marker>
               );

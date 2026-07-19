@@ -154,3 +154,50 @@ def estimate_route_travel_time(graph, route_edges: List[str], blocked_edges=None
         if cost != float("inf"):
             total += cost
     return total
+
+
+def reorder_sinks_last(graph, customer_order: List[Dict]) -> List[Dict]:
+    """
+    Di chuyển các customer có target_node là 'sink' (không thể đi tiếp đến các khách khác)
+    về cuối danh sách.
+    """
+    if not customer_order:
+        return []
+
+    # Lấy target_node cho từng customer
+    nodes = []
+    for c in customer_order:
+        lat = c.get("latitude")
+        lon = c.get("longitude")
+        if lat is not None and lon is not None:
+            tnode = graph.nearest_node_to_point(lat, lon)
+            nodes.append((c, tnode))
+        else:
+            nodes.append((c, None))
+
+    normal_customers = []
+    sink_customers = []
+
+    # Một node là sink nếu từ nó có thể đi tới ít hơn 100 node trong đồ thị
+    for c, tnode in nodes:
+        if tnode is None:
+            normal_customers.append(c)
+            continue
+
+        # BFS đếm số node reachable
+        visited = set()
+        queue = [tnode]
+        while queue and len(visited) < 100:
+            curr = queue.pop(0)
+            if curr in visited:
+                continue
+            visited.add(curr)
+            for n in graph.adjacency.get(curr, []):
+                queue.append(n["to_node"])
+
+        if len(visited) < 100:
+            sink_customers.append(c)
+        else:
+            normal_customers.append(c)
+
+    return normal_customers + sink_customers

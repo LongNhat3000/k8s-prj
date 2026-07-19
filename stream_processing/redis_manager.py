@@ -55,6 +55,9 @@ class RedisWriter:
         if not self._client:
             return False
 
+        if self._client.exists(f"simulate_congestion:{edge_id}"):
+            return True
+
         key = f"{self.KEY_PREFIX}:{edge_id}"
 
         try:
@@ -81,6 +84,9 @@ class RedisWriter:
         total_written = 0
 
         try:
+            sim_keys = self._client.keys("simulate_congestion:*")
+            simulated_edges = {k.split(":", 1)[1] for k in sim_keys} if sim_keys else set()
+
             for i in range(0, len(records), batch_size):
                 chunk = records[i:i + batch_size]
                 pipe = self._client.pipeline(transaction=False)
@@ -91,6 +97,8 @@ class RedisWriter:
                 for rec in chunk:
                     edge_id = rec.get("edge_id")
                     if not edge_id:
+                        continue
+                    if edge_id in simulated_edges:
                         continue
 
                     key = f"{self.KEY_PREFIX}:{edge_id}"

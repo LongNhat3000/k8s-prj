@@ -1,19 +1,19 @@
-# 🚚 Logistics Real-Time — Tối ưu tuyến đường giao hàng thời gian thực
+# Hệ thống tối ưu tuyến đường giao hàng thời gian thực
 
 ## Mô tả
 
-Hệ thống mô phỏng và tối ưu tuyến đường giao hàng real-time cho **100 xe tải × 10 khách hàng** trên bản đồ Hà Nội. Xử lý ~5.000 GPS messages/giây, phát hiện tắc nghẽn, và tự động tái tối ưu tuyến đường bằng Genetic Algorithm + Dijkstra.
+Hệ thống mô phỏng và tối ưu tuyến đường giao hàng real-time cho **100 xe tải** trên bản đồ Hà Nội. Xử lý ~5.000 GPS messages/giây, phát hiện tắc nghẽn, và tự động tái tối ưu tuyến đường bằng Genetic Algorithm + Dijkstra.
 
 ---
 
 ## Kiến trúc hệ thống
 
 ```
-┌────────────────┐         ┌─────────┐         ┌──────────────────┐         ┌───────┐
-│  Bot Simulation│────────▶│  KAFKA  │────────▶│ Stream Processing│────────▶│ REDIS │
-│  (5k xe/GPS)  │  topic: │         │         │ (PySpark)        │  edge:* │       │
-└────────────────┘ gps_stream└────┬────┘         └──────────────────┘         └───┬───┘
-                                  │                                                │
+┌────────────────┐           ┌─────────┐          ┌──────────────────┐           ┌───────┐
+│  Bot Simulation│────────▶ │  KAFKA   │────────▶│ Stream Processing│────────▶  │ REDIS │
+│  (5k xe/GPS)   │  topic:   │         │          │ (PySpark)        │  edge:*   │       │
+└────────────────┘ gps_stream└────┬────┘          └──────────────────┘           └───┬───┘
+                                  │                                                  │
                                   ▼                                                ▼
                     ┌──────────────────────┐                          ┌────────────────────┐
                     │  Dashboard Backend   │◀─── poll traffic ────────│                    │
@@ -30,7 +30,7 @@ Hệ thống mô phỏng và tối ưu tuyến đường giao hàng real-time ch
                     ┌──────────▼───────────┐
                     │  Route Optimization  │
                     │  (Genetic Algorithm) │
-                    │  100 xe × 10 khách   │
+                    │  100 xe  
                     └──────────────────────┘
 ```
 
@@ -119,11 +119,14 @@ Vị trí xe → K3 → K7 → K1 → ... → K10
 
 ---
 
-### Option 1: Kubernetes (Docker Desktop)
+### Option 1: Kubernetes (Docker Desktop / Minikube)
 
 #### 1. Build images
 
-```powershell
+> [!TIP]
+> Nếu bạn sử dụng **Minikube**, hãy chạy lệnh `eval $(minikube docker-env)` trong Terminal trước khi chạy các lệnh `docker build` dưới đây để lưu trực tiếp images vào cụm k8s.
+
+```bash
 docker build -t logictics-bot:latest -f Dockerfile.data_ingestion .
 docker build -t logictics-stream:v5 -f Dockerfile.stream_processing .
 docker build -t logictics-opt:v6 -f Dockerfile.route_optimization .
@@ -133,14 +136,14 @@ docker build -t logictics-frontend:v4 -f Dockerfile.frontend .
 
 #### 2. Deploy infrastructure
 
-```powershell
+```bash
 kubectl apply -f k8s/01-infrastructure.yaml
 kubectl get pods -w                          # Đợi tất cả Running
 ```
 
 #### 3. Init MongoDB ReplicaSet
 
-```powershell
+```bash
 kubectl exec -it deployment/mongodb -- mongosh --eval "rs.initiate({_id:'rs0', members:[{_id:0, host:'mongodb.default.svc.cluster.local:27017'}]})"
 ```
 
@@ -148,61 +151,70 @@ kubectl exec -it deployment/mongodb -- mongosh --eval "rs.initiate({_id:'rs0', m
 
 #### 4. Deploy microservices
 
-```powershell
+```bash
 kubectl apply -f k8s/02-microservices.yaml
 kubectl get pods -w                          # Đợi tất cả Running
 ```
 
 #### 5. Seed dữ liệu
 
-```powershell
+```bash
 kubectl exec -it deployment/route-optimization -- python seed_assigned_routes.py --count 100
 ```
 
 #### 6. Truy cập Dashboard
 
-```powershell
-# Terminal 1
+Bạn có thể chạy ngầm cả 2 lệnh trên cùng **1 Terminal** (thêm ký tự `&` ở cuối):
+
+```bash
+kubectl port-forward svc/dashboard-backend 4000:4000 &
+kubectl port-forward svc/dashboard-frontend 5173:5173 &
+```
+
+*Hoặc mở **2 Terminal** chạy riêng biệt nếu không dùng ký tự `&`:*
+
+```bash
+# Terminal 1: Port-forward Backend
 kubectl port-forward svc/dashboard-backend 4000:4000
 
-# Terminal 2
+# Terminal 2: Port-forward Frontend
 kubectl port-forward svc/dashboard-frontend 5173:5173
 ```
 
 ### 7. Dừng k8s
 
+```bash
 kubectl delete -f k8s/02-microservices.yaml
 kubectl delete -f k8s/01-infrastructure.yaml
+```
 
-### 8. Kiểm tra log
+### 8. Kiểm tra log và gỡ lỗi
 
+```bash
 # Log bot simulation (xem có gửi edge_id không)
-
 kubectl logs deployment/bot-simulator --tail=20
 
-# Log stream-processing (xem Spark còn stuck không)
-
-kubectl logs deployment/stream-processing --tail=50 | findstr /V "WARN"
+# Log stream-processing (xem Spark có chạy bình thường không)
+kubectl logs deployment/stream-processing --tail=50 | grep -v "WARN"
 
 # Log backend (xem kết nối Redis/Mongo/Kafka)
-
 kubectl logs deployment/dashboard-backend --tail=30
 
 # Log route-optimization (xem GA có chạy không)
-
 kubectl logs deployment/route-optimization --tail=20
 
-# Kiểm tra Redis có data traffic chưa
+# Kiểm tra Redis có dữ liệu traffic chưa
+kubectl exec -it deployment/redis -- redis-cli KEYS "edge:*" | head -n 10
 
-kubectl exec -it deployment/redis -- redis-cli KEYS "edge:\*" | Select-Object -First 10
-
+# Xem trực tiếp bản tin GPS gửi lên Kafka
 kubectl exec -it deployment/kafka -- kafka-console-consumer --bootstrap-server kafka:9092 --topic gps_stream --timeout-ms 10000 --max-messages 5
+```
 
 → Mở **http://localhost:5173**
 
 #### Rebuild khi sửa code
 
-```powershell
+```bash
 docker build -t logictics-opt:v6 -f Dockerfile.route_optimization .
 kubectl rollout restart deployment/route-optimization
 ```
@@ -211,12 +223,15 @@ kubectl rollout restart deployment/route-optimization
 
 ### Option 2: Docker Compose
 
-```powershell
+```bash
 cd infrastructure
-docker-compose up -d --build
+docker compose up -d --build
 
-# Seed data
-docker compose exec route_optimization python route_optimization/seed_assigned_routes.py --count 100
+# 1. Khởi tạo MongoDB Replica Set (chỉ cần chạy lần đầu hoặc sau khi chạy docker compose down)
+docker compose exec mongodb mongosh --eval "rs.initiate()"
+
+# 2. Seed dữ liệu lộ trình xe tải vào MongoDB
+docker compose exec route_optimization python seed_assigned_routes.py --count 100
 ```
 
 → Mở **http://localhost:5173**

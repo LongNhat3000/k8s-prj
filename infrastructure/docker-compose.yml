@@ -76,6 +76,7 @@ services:
       context: ../
       dockerfile: Dockerfile.stream_processing
     container_name: service_spark_processor
+    restart: on-failure
     depends_on:
       - kafka
       - redis

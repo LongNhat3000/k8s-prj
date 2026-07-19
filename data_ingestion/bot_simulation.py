@@ -131,14 +131,14 @@ def reload_routes_for_trucks(trucks_list):
 def check_customer_delivery(truck):
     """
     Kiểm tra xe có đến gần customer nào không.
-    Nếu khoảng cách < 100m → đánh dấu delivered.
+    Nếu khoảng cách < 100m hoặc xe đã đi tới node gần nhất của khách hàng trên bản đồ → đánh dấu delivered.
     """
     vid = truck.entity_id
     customers = mongo_customers.get(vid, [])
     if not customers:
         return
     
-    DELIVERY_RADIUS = 0.0002  # ~22m (khoảng 0.0002 độ ≈ 20m)
+    DELIVERY_RADIUS = 0.0005  # ~55m (khoảng 0.0005 độ ≈ 50m)
     
     for cust in customers:
         if cust.get("status") == "delivered":
@@ -147,9 +147,21 @@ def check_customer_delivery(truck):
         clat = cust.get("latitude", 0)
         clon = cust.get("longitude", 0)
         
+        # Check 1: Khoảng cách Manhattan trực tiếp
         dist = abs(truck.latitude - clat) + abs(truck.longitude - clon)
         
-        if dist < DELIVERY_RADIUS:
+        # Check 2: Xe đi tới node gần nhất của customer trên bản đồ (cache lại để tránh tính toán nhiều)
+        target_node_id = cust.get("target_node_id")
+        if not target_node_id:
+            target_node_id = nearest_node(clat, clon)
+            cust["target_node_id"] = target_node_id
+            
+        curr_start = truck.current_edge['start_node']['node_id']
+        curr_end = truck.current_edge['end_node']['node_id']
+        is_at_node = (curr_start == target_node_id or curr_end == target_node_id)
+        
+        if dist < DELIVERY_RADIUS or is_at_node:
+            print(f"🎉 Xe {vid} đã giao hàng thành công cho khách {cust.get('cust_id')}!")
             cust["status"] = "delivered"
             _delivery_queue.append((vid, cust.get("cust_id")))
             # Cập nhật customer tiếp theo thành "next"
@@ -177,26 +189,35 @@ def flush_delivery_updates():
     mongo_uri = os.getenv("MONGO_URI", "mongodb://mongodb:27017/")
     try:
         from pymongo import MongoClient
+        from collections import defaultdict
         client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
         coll = client["traffic_system"]["assigned_routes"]
         
         # Group by vehicle_id
-        vehicles_to_update = set(vid for vid, _ in _delivery_queue)
-        for vid in vehicles_to_update:
+        delivered_by_vehicle = defaultdict(list)
+        for vid, cust_id in _delivery_queue:
+            delivered_by_vehicle[vid].append(cust_id)
+            
+        for vid, cust_ids in delivered_by_vehicle.items():
             customers = mongo_customers.get(vid, [])
             if customers:
                 coll.update_one(
                     {"vehicle_id": vid},
-                    {"$set": {"customers": customers}}
+                    {
+                        "$set": {"customers": customers},
+                        "$pull": {
+                            "remaining_customers": {"cust_id": {"$in": cust_ids}}
+                        }
+                    }
                 )
         
         delivered_count = len(_delivery_queue)
         _delivery_queue = []
         client.close()
         if delivered_count > 0:
-            print(f"📦 Đã giao hàng cho {delivered_count} customers (đổi màu trên dashboard).")
+            print(f"📦 Đã giao hàng cho {delivered_count} customers (đổi màu trên dashboard và cập nhật MongoDB).")
     except Exception as e:
-        pass  # Best effort — không block main loop
+        print(f"❌ Lỗi flush delivery: {e}")
 
 
 # ============================================================
@@ -329,15 +350,16 @@ class Vehicle:
             edge_vehicle_count[first_edge['edge_id']] += 1
             
         else:
-            # FALLBACK: không có route trong MongoDB → tự tính Dijkstra
+            # FALLBACK: không có route trong MongoDB → đỗ xe yên tại chỗ chờ đơn hàng từ dashboard
             self.current_edge = random.choices(self.all_edges, weights=Vehicle.cached_edge_lengths, k=1)[0]
             self.latitude = self.current_edge['start_node']['lat']
             self.longitude = self.current_edge['start_node']['lon']
             self.progress_meters = 0.0
-            self.speed = self.current_edge['max_speed_kmh']
+            self.speed = 0.0
             self.stuck_count = 0
             edge_vehicle_count[self.current_edge['edge_id']] += 1
-            self._fallback_dijkstra_route()
+            self._route_edges = None
+            self._route_index = 0
 
     def _fallback_dijkstra_route(self):
         """Fallback: tính Dijkstra route khi không có MongoDB data."""
@@ -380,6 +402,18 @@ class Vehicle:
             self.target_edge = random.choice(self.all_edges)
 
     def move(self):
+        if self.entity_type == "Truck" and (not self._route_edges or self._route_index >= len(self._route_edges)):
+            self.speed = 0.0
+            if self._route_edges and self._route_index >= len(self._route_edges) - 1:
+                e = self.current_edge['end_node']
+                self.latitude = e['lat']
+                self.longitude = e['lon']
+            else:
+                s = self.current_edge['start_node']
+                self.latitude = s['lat']
+                self.longitude = s['lon']
+            return
+
         edge_id = self.current_edge['edge_id']
         length_m = self.current_edge['length_meters']
         max_speed = self.current_edge['max_speed_kmh']
@@ -418,8 +452,11 @@ class Vehicle:
         self._route_index += 1
         
         if self._route_index >= len(self._route_edges):
-            # Hoàn thành route → tạo 10 customers mới và tính route tiếp
-            self._generate_new_delivery_cycle()
+            # Hoàn thành route → Dừng lại đỗ xe và chờ đơn hàng mới từ dashboard
+            self._route_index = len(self._route_edges) - 1
+            self.progress_meters = self.current_edge['length_meters']
+            self.speed = 0.0
+            edge_vehicle_count[self.current_edge['edge_id']] += 1
             return
         
         next_edge = self._route_edges[self._route_index]
@@ -441,8 +478,11 @@ class Vehicle:
                 self.stuck_count = 0
                 self._route_index += 1
                 if self._route_index >= len(self._route_edges):
-                    # Hết route → tạo delivery cycle mới thay vì teleport
-                    self._generate_new_delivery_cycle()
+                    # Hết route → Dừng lại đỗ xe và chờ đơn hàng mới từ dashboard
+                    self._route_index = len(self._route_edges) - 1
+                    self.progress_meters = self.current_edge['length_meters']
+                    self.speed = 0.0
+                    edge_vehicle_count[self.current_edge['edge_id']] += 1
                     return
                 next_edge = self._route_edges[self._route_index]
                 self._enter_edge(next_edge)

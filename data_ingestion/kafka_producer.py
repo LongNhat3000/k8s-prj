@@ -21,8 +21,6 @@ class GPSProducer:
     def delivery_report(self, err, msg):
         if err is not None:
             print(f"[LỖI] Gửi thất bại: {err}")
-        else:
-            print(f"[OK] Đã gửi tới topic {msg.topic()} [{msg.partition()}]")
 
     def produce_message(self, data_dict):
         json_data = json.dumps(data_dict).encode('utf-8')

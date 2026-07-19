@@ -115,6 +115,12 @@ def build_new_assigned_route(
         if not optimized_customers:
             optimized_customers = opt_input.get("remaining_customers", [])
 
+        # Di chuyển các sink nodes (dead-ends) về cuối danh sách
+        from route_builder import reorder_sinks_last
+        optimized_customers = reorder_sinks_last(graph, optimized_customers)
+        ga_result["optimized_customers"] = optimized_customers
+        ga_result["optimized_customer_order"] = [c.get("cust_id") for c in optimized_customers]
+
         blocked_edges = opt_input.get("blocked_edges", [])
 
         new_route = build_route(
@@ -142,6 +148,7 @@ def save_optimization_result_to_mongo(
     new_assigned_route: list,
     customers: list = None,
     reroute_reason: str = "",
+    old_customers: list = None,
 ) -> bool:
     """
     Cap nhat ket qua optimization vao MongoDB theo schema dashboard.
@@ -156,23 +163,48 @@ def save_optimization_result_to_mongo(
     """
     estimated_total_travel_time = ga_result.get("estimated_total_cost", 0)
 
-    # Xây dựng customers với status cho Frontend
+    # Xây dựng customers với status cho Frontend, giữ nguyên những khách đã giao
     customers_with_status = []
+    delivered_customers = []
+    if old_customers:
+        delivered_customers = [c for c in old_customers if c.get("status") == "delivered"]
+    
+    customers_with_status.extend(delivered_customers)
+
     optimized_customers = ga_result.get("optimized_customers", [])
     if optimized_customers:
         for idx, cust in enumerate(optimized_customers):
+            cust_id = cust.get("cust_id")
+            if any(dc.get("cust_id") == cust_id for dc in delivered_customers):
+                continue
             customers_with_status.append({
-                "cust_id": cust.get("cust_id", f"Cust_{idx+1}"),
+                "cust_id": cust_id,
                 "latitude": cust.get("latitude", 0),
                 "longitude": cust.get("longitude", 0),
-                "order": idx + 1,
+                "order": len(customers_with_status) + 1,
                 "status": "pending",  # pending | next | delivered
             })
-        # Đánh dấu customer đầu tiên là "next"
-        if customers_with_status:
-            customers_with_status[0]["status"] = "next"
+        # Đánh dấu customer đầu tiên chưa giao là "next"
+        for cust in customers_with_status:
+            if cust.get("status") == "pending":
+                cust["status"] = "next"
+                break
     elif customers:
-        customers_with_status = customers
+        for idx, cust in enumerate(customers):
+            cust_id = cust.get("cust_id")
+            if any(dc.get("cust_id") == cust_id for dc in delivered_customers):
+                continue
+            customers_with_status.append({
+                "cust_id": cust_id,
+                "latitude": cust.get("latitude", 0),
+                "longitude": cust.get("longitude", 0),
+                "order": len(customers_with_status) + 1,
+                "status": "pending",
+            })
+        for cust in customers_with_status:
+            if cust.get("status") == "pending":
+                cust["status"] = "next"
+                break
 
     update_doc = {
         "$set": {
@@ -196,6 +228,7 @@ def save_optimization_result_to_mongo(
             },
             "last_optimized_at": now_ms(),
             "route_status": "optimized",
+            "needs_optimization": False,
         }
     }
 
@@ -289,6 +322,7 @@ def optimize_vehicle(
                 new_assigned_route=new_assigned_route,
                 customers=opt_input.get("remaining_customers", []),
                 reroute_reason=reroute_reason,
+                old_customers=vehicle_doc.get("customers", []),
             )
 
         # Ghi lại thời điểm re-route
@@ -322,7 +356,8 @@ def optimize_many_vehicles(
     for vehicle_doc in vehicle_docs:
         new_route = vehicle_doc.get("new_assigned_route")
         needs_bootstrap = not (isinstance(new_route, list) and len(new_route) > 0)
-        effective_force = bool(force or needs_bootstrap)
+        needs_opt_flag = vehicle_doc.get("needs_optimization", False)
+        effective_force = bool(force or needs_bootstrap or needs_opt_flag)
 
         result = optimize_vehicle(
             vehicle_doc=vehicle_doc,
@@ -486,9 +521,15 @@ if __name__ == "__main__":
                     force=False # Chỉ chạy lại thuật toán GA khi đường bị kẹt (theo logic của bạn)
                 )
                 
-                # In log cho đẹp để dễ theo dõi trong Terminal
-                if result["optimized_count"] > 0:
-                    print(f"[CẬP NHẬT] Đã tính toán lại đường đi cho {result['optimized_count']} xe do kẹt xe!")
+                for res in result.get("results", []):
+                    status = res.get("status")
+                    vid = res.get("vehicle_id")
+                    if status == "error":
+                        print(f"❌ Lỗi tối ưu xe {vid}: {res.get('reason')}")
+                        if "traceback" in res:
+                            print(res["traceback"])
+                    elif status == "optimized":
+                        print(f"✅ Đã tối ưu thành công cho xe {vid}!")
             
         except Exception as e:
             print(f"❌ Lỗi vòng lặp: {e}")

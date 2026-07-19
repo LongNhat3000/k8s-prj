@@ -1,4 +1,4 @@
-# Tự tạo thư viên riêng ở máy mỗi người
+# tạo thư viên 
 venv
 node_modules
 __pycache__
